@@ -1,0 +1,12 @@
+torch
+torchvision
+opencv-python
+numpy
+Pillow
+mediapipe
+rembg
+tqdm
+openmim
+onnxruntime
+scikit-image
+Pillow

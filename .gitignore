@@ -1,0 +1,29 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.env/
+.venv/
+
+# IDE files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Optional: logs
+*.log
+
+# Large model/binary files
+*.pt
+*.pth
+*.onnx
+*.deb
+/models/
+/data/
+pytorch3d/Miniconda3-latest-Linux-x86_64.sh

@@ -1,0 +1,5 @@
+
+max_resolution: 2048
+background_removal: true
+color_normalization: true
+pose_model: rtmpose-l
