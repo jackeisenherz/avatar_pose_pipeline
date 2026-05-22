@@ -51,7 +51,10 @@ class VisibilityAnalyzer:
             pose_data = json.load(f)
 
         keypoints = np.array(
-            pose_data["keypoints"],
+            [
+                [kp["x"], kp["y"], kp["confidence"]]
+                for kp in pose_data["keypoints"]
+            ],
             dtype=np.float32
         )
 
