@@ -30,7 +30,8 @@ class SilhouetteRenderer:
         self.raster_settings = RasterizationSettings(
             image_size=image_size,
             blur_radius=0.0,
-            faces_per_pixel=50
+            faces_per_pixel=10,
+            bin_size=0
         )
 
     def render(

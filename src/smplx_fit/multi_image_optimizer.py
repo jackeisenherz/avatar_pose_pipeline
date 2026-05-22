@@ -48,11 +48,12 @@ from .losses import (
 
 class MultiImageOptimizer:
 
+    # TODO: once confirmed working, increase image_size back to 1024
     def __init__(
         self,
         model_path,
         gender="female",
-        image_size=1024
+        image_size=512
     ):
 
         self.device = (
@@ -90,7 +91,7 @@ class MultiImageOptimizer:
     # =====================================================
     # MAIN OPTIMIZATION
     # =====================================================
-
+    # TODO: once confirmed working, increase again to 1000 iterations
     def optimize(
         self,
         image_paths,
@@ -242,7 +243,17 @@ class MultiImageOptimizer:
                 mask,
                 dtype=torch.float32,
                 device=self.device
-            ).unsqueeze(0)
+            )
+
+            # [H,W]
+            # -> [1,H,W]
+            # -> [1,1,H,W]
+
+            mask_tensor = (
+                mask_tensor
+                .unsqueeze(0)
+                .unsqueeze(0)
+            )
 
             masks_all.append(
                 mask_tensor
@@ -314,13 +325,6 @@ class MultiImageOptimizer:
             device=self.device
         )
 
-        cameras = create_camera(
-            focal_length=focal_length,
-            camera_center=camera_center,
-            image_size=self.image_size,
-            device=self.device
-        )
-
         # =================================================
         # OPTIMIZATION LOOP
         # =================================================
@@ -384,13 +388,15 @@ class MultiImageOptimizer:
                 # RENDER SILHOUETTE
                 # -----------------------------------------
 
-                rendered_mask = (
-                    self.renderer.render(
-                        vertices=vertices,
-                        faces=self.model.faces_tensor,
-                        cameras=cameras
-                    )
+                rendered = self.renderer.render(
+                    vertices=vertices,
+                    faces=self.model.faces_tensor.unsqueeze(0),
+                    focal_length=focal_length,
+                    principal_point=camera_center,
+                    translation=translations[i]
                 )
+
+                rendered_mask = rendered[..., 3].unsqueeze(1)
 
                 # -----------------------------------------
                 # VISIBILITY MASK
@@ -576,22 +582,14 @@ class MultiImageOptimizer:
                 # -----------------------------------------
                 # FINAL IMAGE LOSS
                 # -----------------------------------------
-
                 image_loss = image_weight * (
-
-                    5.0 * loss_kp +
-
-                    30.0 * loss_sil +
-
-                    1.0 * loss_pseudo +
-
+                    0.00005 * loss_kp +
+                    40.0 * loss_sil +
+                    3.0 * loss_pseudo +
                     0.05 * loss_shape +
-
                     0.01 * loss_pose +
-
                     0.01 * loss_trans
                 )
-
                 total_loss += image_loss
 
             # =============================================
@@ -607,10 +605,11 @@ class MultiImageOptimizer:
             # =============================================
 
             if iteration % 10 == 0:
-
                 progress.set_postfix({
-                    "loss":
-                        f"{total_loss.item():.4f}"
+                    "total": f"{total_loss.item():.2f}",
+                    "kp": f"{loss_kp.item():.2f}",
+                    "sil": f"{loss_sil.item():.4f}",
+                    "pseudo": f"{float(loss_pseudo):.4f}",
                 })
 
         # =================================================

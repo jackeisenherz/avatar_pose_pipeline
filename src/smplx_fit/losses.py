@@ -9,21 +9,35 @@ import torch.nn.functional as F
 def keypoint_loss(
     pred_keypoints,
     gt_keypoints,
-    confidence,
-    joint_weights=None
+    confidence
 ):
 
+    # =============================================
+    # REMOVE LOW CONFIDENCE KEYPOINTS
+    # =============================================
+
+    confidence = torch.where(
+        confidence > 0.4,
+        confidence,
+        torch.zeros_like(confidence)
+    )
+
+    # =============================================
+    # SQUARED ERROR
+    # =============================================
+
     diff = (
-        pred_keypoints - gt_keypoints
+        pred_keypoints -
+        gt_keypoints
     ) ** 2
 
     diff = diff.sum(dim=-1)
 
+    # =============================================
+    # APPLY CONFIDENCE
+    # =============================================
+
     weighted = diff * confidence
-
-    if joint_weights is not None:
-
-        weighted = weighted * joint_weights
 
     return weighted.mean()
 

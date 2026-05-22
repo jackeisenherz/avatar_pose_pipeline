@@ -74,20 +74,18 @@ class BodyRegionWeights:
 
         shoulder_mask = (
             (y > 0.15) &
-            (y < 0.30)
+            (y < 0.30) &
+            (x > 0.10) &
+            (x < 0.90)
         )
-
         # =================================================
         # APPLY REGION WEIGHTS
         # =================================================
 
-        weights[:, chest_mask] *= 3.0
-
-        weights[:, waist_mask] *= 2.0
-
-        weights[:, hip_mask] *= 3.5
-
-        weights[:, shoulder_mask] *= 1.8
+        weights[0][chest_mask] *= 3.0
+        weights[0][waist_mask] *= 2.0
+        weights[0][hip_mask] *= 3.5
+        weights[0][shoulder_mask] *= 1.8
 
         # =================================================
         # EDGE FALLBACK
