@@ -4,11 +4,12 @@ Avatar Pose Pipeline
 """
 
 import argparse
+import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 
 from bootstrap import ensure_dependencies
-from utils import list_images
+from utils import ( list_images, export_npz_to_obj)
 
 from image_resize import ImageResizer
 from background_removal import BackgroundRemover
@@ -53,6 +54,13 @@ def main():
         "--photo-iterations",
         type=int,
         default=2000
+    )
+
+    parser.add_argument(
+        "--refine-iterations",
+        type=int,
+        default=1500,
+        help="Freeform refinement iterations"
     )
 
     args = parser.parse_args()
@@ -100,7 +108,12 @@ def main():
 
     bg_remover = BackgroundRemover()
 
-    color_normalizer = ColorNormalizer()
+    color_normalizer = ColorNormalizer(
+        target_luma=145,
+        target_contrast=52,
+        clahe_clip=1.25,
+        skin_warmth=0.0
+    )
 
     pose_estimator = PoseEstimator(
         model_name="yolov8l-pose.pt"
@@ -285,6 +298,7 @@ def main():
         "canonical_body.npz"
     )
 
+
     multi_optimizer.optimize(
         image_paths=processed_images,
         pose_json_paths=pose_jsons,
@@ -294,6 +308,8 @@ def main():
     )
 
     print("✅ Canonical body created")
+    canonical_obj = dirs["smplx"] / "canonical_body.obj"
+    export_npz_to_obj(canonical_output, canonical_obj)
 
     # =====================================================
     # FREEFORM REFINEMENT
@@ -301,11 +317,19 @@ def main():
 
     print("\n🚀 Freeform refinement...\n")
 
+    refined_output = dirs["refined"] / "refined_body.npz"
+
     mesh_refiner.refine(
         canonical_body_path=canonical_output,
-        image_paths=normalized_images,
+        image_paths=processed_images,
         visibility_paths=visibility_jsons,
-        output_path=dirs["refined"] / "refined_body.npz"
+        output_path=refined_output,
+        iterations=args.refine_iterations
+    )
+
+    export_npz_to_obj(
+        refined_output,
+        dirs["refined"] / "refined_body.obj"
     )
 
     print("✅ Freeform refinement complete")

@@ -15,7 +15,11 @@ from .laplacian import LaplacianRegularizer
 
 
 class MeshRefiner:
-    def __init__(self, image_size=512):
+    # debug:      256px, 30–50 iterations
+    # validation: 512px, 100–300 iterations
+    # final:      1024px, 500–1500 iterations
+    # via CLI --refine-iterations 30
+    def __init__(self, image_size=256):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.image_size = image_size
 

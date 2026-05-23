@@ -8,45 +8,49 @@ from ultralytics import YOLO
 
 class BackgroundRemover:
     """
-    Production-grade avatar background remover.
+    Avatar-safe background remover.
 
-    Pipeline:
-        1. YOLO human segmentation
-        2. Conservative mask selection
-        3. Trimap generation
-        4. MODNet alpha matting
-        5. Foreground protection
-        6. Alpha-only refinement
-        7. RGBA export
-
-    IMPORTANT:
-        - RGB pixels are NEVER modified
-        - Only alpha is refined
-        - Conservative strategy avoids cutting body parts
+    Main principles:
+    - Filter YOLO detections to PERSON class only.
+    - Never let non-person objects become foreground.
+    - Preserve original RGB pixels.
+    - Refine alpha only.
+    - Prefer keeping extra subject pixels over cutting the body.
+    - Save debug masks for inspection.
     """
 
     def __init__(
         self,
         yolo_model="yolov8x-seg.pt",
-        modnet_onnx="modnet.onnx",
+        modnet_onnx="models/modnet/modnet.onnx",
+        confidence=0.15,
+        debug=True
     ):
-        print("Loading YOLO segmentation model...")
+        self.debug = debug
+        self.confidence = confidence
+
+        print("Loading YOLO person segmentation model...")
         self.yolo = YOLO(yolo_model)
 
-        print("Loading MODNet...")
-        self.session = ort.InferenceSession(
-            modnet_onnx,
-            providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
-        )
+        self.use_modnet = Path(modnet_onnx).exists()
 
-        self.input_name = self.session.get_inputs()[0].name
+        if self.use_modnet:
+            print("Loading MODNet...")
+            self.session = ort.InferenceSession(
+                modnet_onnx,
+                providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
+            )
+            self.input_name = self.session.get_inputs()[0].name
+        else:
+            print(f"MODNet not found at {modnet_onnx}; using YOLO-only alpha.")
+            self.session = None
+            self.input_name = None
 
         print("Background remover initialized.")
 
     def process(self, image_path, output_dir):
         image_path = Path(image_path)
         output_dir = Path(output_dir)
-
         output_dir.mkdir(parents=True, exist_ok=True)
 
         orig_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
@@ -54,80 +58,90 @@ class BackgroundRemover:
         if orig_bgr is None:
             raise RuntimeError(f"Failed loading image: {image_path}")
 
-        h, w = orig_bgr.shape[:2]
+        # 1. Person-only YOLO mask
+        person_mask = self._get_person_mask(orig_bgr)
 
-        # =========================================================
-        # 1. YOLO PERSON SEGMENTATION
-        # =========================================================
+        # 2. If YOLO fails, fail loudly instead of producing wrong masks
+        if person_mask is None or person_mask.sum() == 0:
+            raise RuntimeError(
+                f"No reliable person mask found for {image_path.name}. "
+                "Do not continue; wrong masks poison the reconstruction."
+            )
 
-        coarse_mask = self._get_conservative_person_mask(orig_bgr)
+        # 3. Conservative cleanup
+        person_mask = self._clean_person_mask(person_mask)
 
-        # =========================================================
-        # 2. TRIMAP GENERATION
-        # =========================================================
+        # 4. Optional MODNet alpha, constrained by YOLO person area
+        if self.use_modnet:
+            alpha = self._run_modnet(orig_bgr)
+            alpha = self._combine_yolo_and_modnet(alpha, person_mask)
+        else:
+            alpha = person_mask.copy()
 
-        trimap = self._generate_trimap(coarse_mask)
+        # 5. Alpha-only refinement
+        alpha = self._refine_alpha(alpha, person_mask)
 
-        # =========================================================
-        # 3. MODNET ALPHA MATTING
-        # =========================================================
-
-        alpha = self._run_modnet(orig_bgr)
-
-        # =========================================================
-        # 4. FOREGROUND PROTECTION
-        # =========================================================
-
-        alpha = self._protect_foreground(alpha, coarse_mask)
-
-        # =========================================================
-        # 5. EDGE REFINEMENT (ALPHA ONLY)
-        # =========================================================
-
-        alpha = self._refine_alpha(alpha)
-
-        # =========================================================
-        # 6. APPLY TRIMAP CONSTRAINTS
-        # =========================================================
-
-        alpha[trimap == 255] = 255
-        alpha[trimap == 0] = 0
-
-        # =========================================================
-        # 7. EXPORT RGBA
-        # =========================================================
-
+        # 6. Export RGBA without touching RGB
         rgba = cv2.cvtColor(orig_bgr, cv2.COLOR_BGR2BGRA)
         rgba[:, :, 3] = alpha
 
         output_path = output_dir / f"{image_path.stem}.png"
-
         cv2.imwrite(str(output_path), rgba)
+
+        if self.debug:
+            debug_dir = output_dir / "_debug_masks"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+
+            cv2.imwrite(
+                str(debug_dir / f"{image_path.stem}_person_mask.png"),
+                person_mask
+            )
+
+            cv2.imwrite(
+                str(debug_dir / f"{image_path.stem}_alpha.png"),
+                alpha
+            )
 
         print(f"✓ Saved: {output_path}")
 
         return output_path
 
     # =============================================================
-    # PERSON DETECTION
+    # YOLO PERSON MASK
     # =============================================================
 
-    def _get_conservative_person_mask(self, image):
+    def _get_person_mask(self, image):
         h, w = image.shape[:2]
 
-        results = self.yolo(image, verbose=False)[0]
+        results = self.yolo(
+            image,
+            verbose=False,
+            conf=self.confidence,
+            classes=[0]
+        )[0]
 
-        if results.masks is None:
-            raise RuntimeError("No segmentation masks detected.")
+        if results.masks is None or results.boxes is None:
+            return None
 
         masks = results.masks.data.cpu().numpy()
+        boxes = results.boxes
 
-        center = (w // 2, h // 2)
+        if len(masks) == 0:
+            return None
 
-        best_mask = None
-        best_score = -1
+        person_masks = []
 
-        for mask in masks:
+        for idx, mask in enumerate(masks):
+            cls = int(boxes.cls[idx].item())
+
+            # COCO class 0 = person
+            if cls != 0:
+                continue
+
+            conf = float(boxes.conf[idx].item())
+
+            if conf < self.confidence:
+                continue
 
             if mask.shape[:2] != (h, w):
                 mask = cv2.resize(
@@ -136,45 +150,87 @@ class BackgroundRemover:
                     interpolation=cv2.INTER_LINEAR
                 )
 
-            area = mask.sum()
+            mask_u8 = (mask > 0.20).astype(np.uint8) * 255
 
-            center_bonus = (
-                1_000_000
-                if mask[center[1], center[0]] > 0.5
-                else 0
+            area = mask_u8.sum() / 255
+
+            if area < h * w * 0.01:
+                continue
+
+            person_masks.append((mask_u8, conf, area))
+
+        if len(person_masks) == 0:
+            return None
+
+        # Select main subject only.
+        # The real model should be the largest person-like component,
+        # usually lower / central in the image.
+        image_center_x = w / 2
+        image_center_y = h / 2
+
+        best_mask = None
+        best_score = -1
+
+        for mask_u8, conf, area in person_masks:
+            ys, xs = np.where(mask_u8 > 0)
+
+            if len(xs) == 0:
+                continue
+
+            x1, x2 = xs.min(), xs.max()
+            y1, y2 = ys.min(), ys.max()
+
+            bbox_w = x2 - x1
+            bbox_h = y2 - y1
+
+            cx = (x1 + x2) / 2
+            cy = (y1 + y2) / 2
+
+            center_dist = abs(cx - image_center_x) / w
+            vertical_bonus = cy / h
+
+            # Reject tiny wall/photo people
+            if area < h * w * 0.03:
+                continue
+
+            # Reject detections that are too high in the frame,
+            # common for wall pictures/posters.
+            if cy < h * 0.25:
+                continue
+
+            score = (
+                area * 1.0
+                + conf * h * w * 0.2
+                + vertical_bonus * h * w * 0.15
+                - center_dist * h * w * 0.25
             )
-
-            score = area + center_bonus
 
             if score > best_score:
                 best_score = score
-                best_mask = mask
+                best_mask = mask_u8
 
-        mask = (best_mask > 0.35).astype(np.uint8) * 255
+        if best_mask is None:
+            # fallback: largest detected person
+            best_mask = max(person_masks, key=lambda x: x[2])[0]
 
-        # Conservative expansion
-        kernel = np.ones((9, 9), np.uint8)
+        return best_mask
 
-        mask = cv2.dilate(mask, kernel, iterations=2)
+    # =============================================================
+    # MASK CLEANUP
+    # =============================================================
+
+    def _clean_person_mask(self, mask):
+        mask = mask.astype(np.uint8)
+
+        # Do NOT aggressively close; it fills arm/body gaps.
+        kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open, iterations=1)
+
+        # Only tiny dilation for safety.
+        kernel_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mask = cv2.dilate(mask, kernel_dilate, iterations=1)
 
         return mask
-
-    # =============================================================
-    # TRIMAP
-    # =============================================================
-
-    def _generate_trimap(self, mask):
-        kernel = np.ones((15, 15), np.uint8)
-
-        sure_fg = cv2.erode(mask, kernel, iterations=2)
-        sure_bg = cv2.dilate(mask, kernel, iterations=3)
-
-        trimap = np.full(mask.shape, 128, dtype=np.uint8)
-
-        trimap[sure_fg == 255] = 255
-        trimap[sure_bg == 0] = 0
-
-        return trimap
 
     # =============================================================
     # MODNET
@@ -187,14 +243,15 @@ class BackgroundRemover:
 
         input_size = 512
 
-        resized = cv2.resize(rgb, (input_size, input_size))
+        resized = cv2.resize(
+            rgb,
+            (input_size, input_size),
+            interpolation=cv2.INTER_AREA
+        )
 
         tensor = resized.astype(np.float32) / 255.0
-
         tensor = (tensor - 0.5) / 0.5
-
         tensor = np.transpose(tensor, (2, 0, 1))
-
         tensor = np.expand_dims(tensor, axis=0)
 
         matte = self.session.run(
@@ -215,38 +272,80 @@ class BackgroundRemover:
         return matte
 
     # =============================================================
-    # FOREGROUND PROTECTION
+    # COMBINE YOLO + MODNET
     # =============================================================
 
-    def _protect_foreground(self, alpha, coarse_mask):
-        """
-        Prevent body parts from disappearing.
-        False positives are preferred over false negatives.
-        """
+    def _combine_yolo_and_modnet(self, modnet_alpha, person_mask):
+        h, w = person_mask.shape
 
-        protected = np.maximum(alpha, coarse_mask)
+        allowed = cv2.dilate(
+            person_mask,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25)),
+            iterations=1
+        )
 
-        return protected
+        alpha = np.zeros((h, w), dtype=np.uint8)
+        alpha[allowed > 0] = modnet_alpha[allowed > 0]
 
+        # Protect only strong MODNet foreground, not the full YOLO mask.
+        sure_fg = (
+            (person_mask > 0) &
+            (modnet_alpha > 170)
+        ).astype(np.uint8) * 255
+
+        sure_fg = cv2.erode(
+            sure_fg,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+            iterations=1
+        )
+
+        alpha[sure_fg > 0] = 255
+
+        # Carve internal gaps between arms/body.
+        gap_candidates = (
+            (person_mask > 0) &
+            (modnet_alpha < 80)
+        ).astype(np.uint8) * 255
+
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            gap_candidates,
+            connectivity=8
+        )
+
+        min_gap_area = h * w * 0.001
+
+        for label in range(1, num_labels):
+            area = stats[label, cv2.CC_STAT_AREA]
+
+            if area >= min_gap_area:
+                alpha[labels == label] = 0
+
+        return alpha
     # =============================================================
     # ALPHA REFINEMENT ONLY
     # =============================================================
 
-    def _refine_alpha(self, alpha):
-        """
-        IMPORTANT:
-            ONLY refine alpha.
-            NEVER touch RGB.
-        """
+    def _refine_alpha(self, alpha, person_mask):
+        alpha = alpha.astype(np.uint8)
 
+        alpha[alpha < 15] = 0
+        alpha[alpha > 240] = 255
+
+        # Smooth only alpha edge.
         alpha = cv2.GaussianBlur(alpha, (3, 3), 0)
 
-        alpha = cv2.normalize(
-            alpha,
-            None,
-            0,
-            255,
-            cv2.NORM_MINMAX
+        # Protect only very confident inner body.
+        core = (
+            (person_mask > 0) &
+            (alpha > 180)
+        ).astype(np.uint8) * 255
+
+        core = cv2.erode(
+            core,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+            iterations=1
         )
+
+        alpha[core > 0] = 255
 
         return alpha
