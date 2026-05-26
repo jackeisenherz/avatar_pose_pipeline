@@ -1,7 +1,15 @@
 
 # Avatar Pipeline Installer
 
-This package now includes automatic dependency installation.
+Install PyTorch separately first:
+pip install torch==2.6.0+cu124 torchvision==0.21.0+cu124 torchaudio==2.6.0+cu124 \
+  --index-url https://download.pytorch.org/whl/cu124
+
+Then:
+pip install -r requirements.txt --no-build-isolation
+
+
+This package now includes automatic dependency installation. 
 
 ## Features
 
