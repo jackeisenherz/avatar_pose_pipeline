@@ -2,61 +2,38 @@ import torch
 
 
 class LaplacianRegularizer:
+    """
+    Fast edge-based smoothness regularizer.
 
-    def __init__(self, faces, num_vertices, device="cuda"):
+    For freeform refinement, regularizing offsets is usually safer than
+    regularizing absolute vertices because it preserves the SMPL-X surface.
+    """
 
+    def __init__(self, faces, device="cuda"):
         self.device = device
 
-        self.neighbors = self._build_neighbors(
-            faces,
-            num_vertices
-        )
+        if isinstance(faces, torch.Tensor):
+            f = faces.detach().long().cpu()
+        else:
+            f = torch.tensor(faces, dtype=torch.long)
 
-    def _build_neighbors(
-        self,
-        faces,
-        num_vertices
-    ):
+        if f.dim() == 3:
+            f = f[0]
 
-        neighbors = [
-            set()
-            for _ in range(num_vertices)
-        ]
+        edges = torch.cat([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]], dim=0)
+        edges = torch.sort(edges, dim=1).values
+        edges = torch.unique(edges, dim=0)
+        self.edges = edges.to(device=device, dtype=torch.long)
 
-        faces = faces.cpu().numpy()
+    def edge_smoothness(self, values):
+        if values.dim() == 2:
+            values = values.unsqueeze(0)
+        a = values[:, self.edges[:, 0]]
+        b = values[:, self.edges[:, 1]]
+        return ((a - b) ** 2).mean()
 
-        for f in faces:
+    def offset_loss(self, offsets):
+        return self.edge_smoothness(offsets)
 
-            a, b, c = f
-
-            neighbors[a].update([b, c])
-            neighbors[b].update([a, c])
-            neighbors[c].update([a, b])
-
-        return [
-            torch.tensor(
-                list(n),
-                dtype=torch.long,
-                device=self.device
-            )
-            for n in neighbors
-        ]
-
-    def loss(self, vertices):
-
-        total = 0.0
-
-        for vidx, nbrs in enumerate(self.neighbors):
-
-            if len(nbrs) == 0:
-                continue
-
-            v = vertices[:, vidx]
-
-            nbr_mean = vertices[:, nbrs].mean(dim=1)
-
-            total += (
-                (v - nbr_mean) ** 2
-            ).mean()
-
-        return total / len(self.neighbors)
+    def surface_loss(self, vertices):
+        return self.edge_smoothness(vertices)

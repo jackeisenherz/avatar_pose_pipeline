@@ -24,6 +24,26 @@ This package now includes automatic dependency installation.
 python src/main.py --input data/input --output outputs
 ```
 
+Only preprocessing
+```bash
+python3 src/main.py --input data/input --output data/output --only preprocess
+```
+
+Reuse preprocessing, run SMPL-X only
+```bash
+python3 src/main.py --input data/input --output data/output --only smplx
+```
+
+Skip preprocessing and photometric
+```bash
+python3 src/main.py --input data/input --output data/output --skip preprocess photometric
+```
+
+Disable render debug overlays
+```bash
+python3 src/main.py --input data/input --output data/output --no-render-debug
+```
+
 OR manually install everything:
 
 ```bash
