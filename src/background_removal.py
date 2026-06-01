@@ -44,6 +44,12 @@ Notes:
     - The subject is assumed to be unclothed, so skin probability is a strong prior.
     - If optional models fail, the class continues with available signals unless fail_hard=True.
     - Debug output writes per-prior masks into output_dir/_debug_masks.
+    - Hair-aware outputs are written for downstream SMPL-X fitting:
+        <stem>_hair.png
+        <stem>_hair_remove.png
+        <stem>_alpha_original.png
+        <stem>_body_fit_mask.png
+        <stem>_silhouette_validity.png
 """
 
 from __future__ import annotations
@@ -69,6 +75,7 @@ class ModelStatus:
     depth: bool = False
     pose: bool = False
     vitmatte: bool = False
+    hair: bool = False
 
 
 @dataclass
@@ -98,6 +105,10 @@ class BackgroundRemover:
         min_subject_area: float = 0.006,
         max_subject_area: float = 0.68,
         threshold: float = 0.50,
+        enable_hair_mask: bool = True,
+        hair_remove_from_output: bool = True,
+        hair_confidence_threshold: float = 0.42,
+        hair_dilate_px: int = 9,
     ) -> None:
         self.debug = debug
         self.fail_hard = fail_hard
@@ -106,6 +117,16 @@ class BackgroundRemover:
         self.min_subject_area = float(min_subject_area)
         self.max_subject_area = float(max_subject_area)
         self.threshold = float(threshold)
+        self.enable_hair_mask = bool(enable_hair_mask)
+        self.hair_remove_from_output = bool(hair_remove_from_output)
+        self.hair_confidence_threshold = float(hair_confidence_threshold)
+        self.hair_dilate_px = int(hair_dilate_px)
+
+        # Filled by _run_parser(). Kept as attributes so the parser API remains
+        # backward-compatible: _run_parser() still returns body probability only.
+        self._last_parser_hair_prob = None
+        self._last_parser_body_prob = None
+        self._last_parser_face_prob = None
 
         self.status = ModelStatus()
 
@@ -258,6 +279,13 @@ class BackgroundRemover:
 
         boxes = self._detect_person_boxes(bgr)
         parser_prob = self._run_parser(rgb)
+        parser_hair_prob = self._last_parser_hair_prob
+        if parser_hair_prob is None or parser_hair_prob.shape != (h, w):
+            parser_hair_prob = np.zeros((h, w), np.float32)
+        parser_face_prob = self._last_parser_face_prob
+        if parser_face_prob is None or parser_face_prob.shape != (h, w):
+            parser_face_prob = np.zeros((h, w), np.float32)
+
         box = self._choose_subject_box(boxes, parser_prob, (h, w))
         if box is None:
             box = np.array([0, 0, w - 1, h - 1], dtype=np.float32)
@@ -381,6 +409,44 @@ class BackgroundRemover:
             box=box,
         )
 
+        # --------------------------------------------------------------
+        # Hair-aware fitting artifacts
+        # --------------------------------------------------------------
+        # alpha_original keeps the complete foreground alpha before hair removal.
+        # body_fit_alpha is the alpha written into the RGBA output by default,
+        # so downstream SMPL-X fitting does not treat loose hair as torso volume.
+        alpha_original = alpha.copy()
+
+        hair_prob = self._hair_probability(
+            bgr=bgr,
+            rgb=rgb,
+            parser_hair_prob=parser_hair_prob,
+            parser_face_prob=parser_face_prob,
+            fused_prob=fused_prob,
+            skin_prob=skin_prob,
+            parser_prob=parser_prob,
+            pose_prior=pose_prior,
+            box=box,
+        )
+
+        hair_remove, body_fit_mask, silhouette_validity = self._hair_fit_masks(
+            hair_prob=hair_prob,
+            alpha=alpha_original,
+            binary=binary,
+            skin_prob=skin_prob,
+            parser_prob=parser_prob,
+            parser_face_prob=parser_face_prob,
+            pose_prior=pose_prior,
+            box=box,
+        )
+
+        body_fit_alpha = alpha_original.copy()
+        body_fit_alpha[hair_remove > 0] = 0
+        body_fit_alpha = cv2.bitwise_and(body_fit_alpha, body_fit_mask)
+
+        if self.hair_remove_from_output and self.enable_hair_mask:
+            alpha = body_fit_alpha
+
         rgba = cv2.cvtColor(bgr, cv2.COLOR_BGR2BGRA)
         rgba[:, :, 3] = alpha
 
@@ -400,6 +466,8 @@ class BackgroundRemover:
                     "biref": biref_prob,
                     "sam": sam_prob,
                     "parser": parser_prob,
+                    "parser_hair": parser_hair_prob,
+                    "parser_face": parser_face_prob,
                     "depth": depth_prob,
                     "skin": skin_prob,
                     "skin_seed": skin_seed,
@@ -407,6 +475,11 @@ class BackgroundRemover:
                     "fused": fused_prob,
                     "ownership": anatomy_ownership,
                     "binary": binary,
+                    "hair": hair_prob,
+                    "hair_remove": hair_remove,
+                    "alpha_original": alpha_original,
+                    "body_fit_mask": body_fit_mask,
+                    "silhouette_validity": silhouette_validity,
                     "alpha": alpha,
                 },
             )
@@ -492,7 +565,27 @@ class BackgroundRemover:
         ], dtype=np.float32)
 
     def _run_parser(self, rgb: np.ndarray) -> np.ndarray:
+        """
+        Human parsing split into separate semantic maps.
+
+        Returns:
+            parser_body_prob: human body/skin/limb probability excluding hair.
+
+        Side effects:
+            self._last_parser_hair_prob
+            self._last_parser_body_prob
+            self._last_parser_face_prob
+
+        This distinction is important: hair is foreground, but it is not body
+        geometry for SMPL-X fitting. The old parser map included hair in the
+        body prior, which encouraged the optimizer to fit loose hair as torso,
+        shoulder, back or chest volume.
+        """
         h, w = rgb.shape[:2]
+        self._last_parser_hair_prob = np.zeros((h, w), np.float32)
+        self._last_parser_body_prob = np.zeros((h, w), np.float32)
+        self._last_parser_face_prob = np.zeros((h, w), np.float32)
+
         if self.parser_model is None:
             return np.zeros((h, w), np.float32)
 
@@ -512,30 +605,79 @@ class BackgroundRemover:
             probs = torch.softmax(logits, dim=1)[0].detach().cpu().numpy()
 
             id2label = self.parser_model.config.id2label
-            keep_words = (
-                "skin", "face", "hair", "head", "neck", "torso", "body",
-                "arm", "hand", "leg", "foot", "left", "right", "upper", "lower",
-            )
+
+            hair_ids = []
+            face_ids = []
+            body_ids = []
+
+            # Clothing/accessory/background classes are not useful as body geometry.
             drop_words = (
                 "background", "bag", "hat", "cap", "glasses", "sunglass", "jewelry",
                 "shoe", "sock", "dress", "skirt", "pants", "coat", "shirt", "top",
-                "belt",
+                "belt", "scarf", "tie", "umbrella", "object",
             )
-            keep_ids = []
+
+            hair_words = ("hair", "hairstyle", "head hair")
+            face_words = ("face", "neck", "ear", "nose", "mouth", "eye", "brow")
+            body_words = (
+                "skin", "torso", "body", "arm", "hand", "leg", "foot",
+                "left", "right", "upper", "lower", "thigh", "calf", "forearm",
+                "chest", "belly", "abdomen", "hip", "shoulder",
+            )
+
             for idx, label in id2label.items():
                 s = str(label).lower()
+                idx = int(idx)
+
                 if any(d in s for d in drop_words):
                     continue
-                if any(k in s for k in keep_words):
-                    keep_ids.append(int(idx))
 
-            if not keep_ids:
-                keep_ids = [int(i) for i, label in id2label.items() if "background" not in str(label).lower()]
+                if any(hw in s for hw in hair_words):
+                    hair_ids.append(idx)
+                    continue
 
-            prob = probs[keep_ids].sum(axis=0)
-            prob = np.clip(prob, 0.0, 1.0).astype(np.float32)
-            prob = cv2.GaussianBlur(prob, (5, 5), 0)
-            return prob
+                if any(fw in s for fw in face_words):
+                    face_ids.append(idx)
+                    body_ids.append(idx)
+                    continue
+
+                if any(bw in s for bw in body_words):
+                    body_ids.append(idx)
+
+            # Fallback if labels are unusual: keep all non-background/non-clothing
+            # as body, but still exclude explicit hair if present.
+            if not body_ids:
+                for idx, label in id2label.items():
+                    s = str(label).lower()
+                    if any(d in s for d in drop_words):
+                        continue
+                    if any(hw in s for hw in hair_words):
+                        continue
+                    body_ids.append(int(idx))
+
+            hair_prob = probs[hair_ids].sum(axis=0) if hair_ids else np.zeros((h, w), np.float32)
+            face_prob = probs[face_ids].sum(axis=0) if face_ids else np.zeros((h, w), np.float32)
+            body_prob = probs[body_ids].sum(axis=0) if body_ids else np.zeros((h, w), np.float32)
+
+            hair_prob = np.clip(hair_prob, 0.0, 1.0).astype(np.float32)
+            face_prob = np.clip(face_prob, 0.0, 1.0).astype(np.float32)
+            body_prob = np.clip(body_prob, 0.0, 1.0).astype(np.float32)
+
+            # Make sure explicit hair probability is not fed back as body.
+            body_prob = np.clip(body_prob * (1.0 - 0.85 * hair_prob), 0.0, 1.0)
+
+            hair_prob = cv2.GaussianBlur(hair_prob, (5, 5), 0)
+            face_prob = cv2.GaussianBlur(face_prob, (5, 5), 0)
+            body_prob = cv2.GaussianBlur(body_prob, (5, 5), 0)
+
+            self._last_parser_hair_prob = hair_prob
+            self._last_parser_body_prob = body_prob
+            self._last_parser_face_prob = face_prob
+
+            if float(np.max(hair_prob)) > 1e-4:
+                self.status.hair = True
+
+            return body_prob
         except Exception as exc:
             self._runtime_warning("parser", exc)
             return np.zeros((h, w), np.float32)
@@ -1348,6 +1490,164 @@ class BackgroundRemover:
     # Matting
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Hair-aware body fitting masks
+    # ------------------------------------------------------------------
+
+    def _hair_probability(
+        self,
+        bgr: np.ndarray,
+        rgb: np.ndarray,
+        parser_hair_prob: np.ndarray,
+        parser_face_prob: np.ndarray,
+        fused_prob: np.ndarray,
+        skin_prob: np.ndarray,
+        parser_prob: np.ndarray,
+        pose_prior: PosePrior,
+        box: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Estimate loose hair probability.
+
+        The primary signal is the human parser's hair class. A conservative
+        dark-hair fallback is added only near the head/upper torso and only when
+        pixels are part of the foreground but not skin/body. This avoids turning
+        dark background into hair.
+        """
+        h, w = fused_prob.shape
+        if not self.enable_hair_mask:
+            return np.zeros((h, w), np.float32)
+
+        hair = np.clip(parser_hair_prob.astype(np.float32), 0.0, 1.0)
+
+        x1, y1, x2, y2 = box.astype(float)
+        bw, bh = max(1.0, x2 - x1), max(1.0, y2 - y1)
+
+        upper_roi = np.zeros((h, w), np.float32)
+        yy1 = int(max(0, y1 - 0.05 * bh))
+        yy2 = int(min(h - 1, y1 + 0.62 * bh))
+        xx1 = int(max(0, x1 - 0.12 * bw))
+        xx2 = int(min(w - 1, x2 + 0.12 * bw))
+        upper_roi[yy1:yy2 + 1, xx1:xx2 + 1] = 1.0
+
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
+        value = hsv[:, :, 2] / 255.0
+        sat = hsv[:, :, 1] / 255.0
+
+        # Conservative generic hair-color prior. It is intentionally weak and
+        # only active for foreground-ish, non-skin, upper-body pixels.
+        dark_hair = (value < 0.30) & (sat > 0.10)
+        non_skin = skin_prob < 0.22
+        weak_body = parser_prob < 0.35
+        foregroundish = (fused_prob > 0.34) | (parser_hair_prob > 0.15)
+
+        color_hair = (
+            dark_hair.astype(np.float32)
+            * non_skin.astype(np.float32)
+            * foregroundish.astype(np.float32)
+            * upper_roi
+            * np.clip(1.0 - parser_face_prob, 0.0, 1.0)
+        )
+
+        # Prefer parser hair. Use color fallback only as extra evidence.
+        hair = np.maximum(hair, 0.45 * color_hair)
+
+        # If pose landmarks exist, allow hair around head/shoulders and along
+        # the sides of the upper torso, but do not let this become a full-body mask.
+        near_body = cv2.dilate(
+            ((fused_prob > 0.40) | (parser_prob > 0.30) | (parser_hair_prob > 0.20)).astype(np.uint8) * 255,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (41, 41)),
+            iterations=1,
+        ).astype(np.float32) / 255.0
+        hair *= np.maximum(0.25, near_body)
+        hair *= self._roi_probability((h, w), box)
+
+        hair = cv2.GaussianBlur(hair.astype(np.float32), (7, 7), 0)
+        return np.clip(hair, 0.0, 1.0).astype(np.float32)
+
+    def _hair_fit_masks(
+        self,
+        hair_prob: np.ndarray,
+        alpha: np.ndarray,
+        binary: np.ndarray,
+        skin_prob: np.ndarray,
+        parser_prob: np.ndarray,
+        parser_face_prob: np.ndarray,
+        pose_prior: PosePrior,
+        box: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Create three artifacts:
+
+        hair_remove:
+            confident loose hair pixels to remove from the fitting alpha.
+
+        body_fit_mask:
+            binary body mask after removing hair. This is the mask that should
+            be used as target silhouette for SMPL-X fitting.
+
+        silhouette_validity:
+            255 = reliable silhouette/background evidence.
+            0   = hair-occluded/unknown; a fitting loss should ignore these
+                  pixels rather than treating them as background.
+        """
+        h, w = alpha.shape
+        if not self.enable_hair_mask:
+            body = ((alpha > 5).astype(np.uint8) * 255)
+            return np.zeros((h, w), np.uint8), body, np.ones((h, w), np.uint8) * 255
+
+        hair_core = (hair_prob > self.hair_confidence_threshold).astype(np.uint8) * 255
+
+        # Slightly dilate to cover anti-aliased hair edges and fine strands.
+        k = max(1, int(self.hair_dilate_px)) | 1
+        hair_core = cv2.dilate(
+            hair_core,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)),
+            iterations=1,
+        )
+
+        # Protect skin/body/face. We want to remove hair, not carve away face,
+        # neck, arms, breasts, torso, or legs.
+        protect = (
+            (skin_prob > 0.34)
+            | (parser_face_prob > 0.30)
+            | ((parser_prob > 0.50) & (skin_prob > 0.18))
+            | ((pose_prior.tubes > 0.55) & (skin_prob > 0.18))
+        ).astype(np.uint8) * 255
+
+        protect = cv2.dilate(
+            protect,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+            iterations=1,
+        )
+
+        hair_remove = cv2.bitwise_and(hair_core, cv2.bitwise_not(protect))
+
+        # Limit removal to current foreground/body neighborhood. This avoids
+        # writing random hair masks in pure background.
+        foreground = ((alpha > 5) | (binary > 0)).astype(np.uint8) * 255
+        foreground = cv2.dilate(
+            foreground,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+            iterations=1,
+        )
+        hair_remove = cv2.bitwise_and(hair_remove, foreground)
+
+        body_fit_mask = ((alpha > 5).astype(np.uint8) * 255)
+        body_fit_mask[hair_remove > 0] = 0
+        body_fit_mask = self._remove_small_components(body_fit_mask, max(25, int(body_fit_mask.size * 0.00005)))
+
+        # Hair is not background; it is unknown occlusion for shape fitting.
+        unknown = cv2.dilate(
+            hair_remove,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (max(3, k), max(3, k))),
+            iterations=1,
+        )
+        silhouette_validity = np.ones((h, w), np.uint8) * 255
+        silhouette_validity[unknown > 0] = 0
+
+        return hair_remove.astype(np.uint8), body_fit_mask.astype(np.uint8), silhouette_validity.astype(np.uint8)
+
     def _matte_alpha(self, rgb: np.ndarray, binary: np.ndarray) -> np.ndarray:
         if self.vitmatte is None:
             return binary.copy()
@@ -1811,6 +2111,10 @@ if __name__ == "__main__":
     parser.add_argument("--no-pose", action="store_true")
     parser.add_argument("--fail-hard", action="store_true")
     parser.add_argument("--threshold", type=float, default=0.50)
+    parser.add_argument("--no-hair-mask", action="store_true")
+    parser.add_argument("--keep-hair-in-output-alpha", action="store_true")
+    parser.add_argument("--hair-threshold", type=float, default=0.42)
+    parser.add_argument("--hair-dilate-px", type=int, default=9)
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
@@ -1825,6 +2129,10 @@ if __name__ == "__main__":
         use_pose=not args.no_pose,
         fail_hard=args.fail_hard,
         threshold=args.threshold,
+        enable_hair_mask=not args.no_hair_mask,
+        hair_remove_from_output=not args.keep_hair_in_output_alpha,
+        hair_confidence_threshold=args.hair_threshold,
+        hair_dilate_px=args.hair_dilate_px,
         debug=args.debug,
     )
 

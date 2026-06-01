@@ -1,0 +1,15 @@
+# ViTPose pose estimation without MMCV/MMPose/MMEngine.
+
+# Core dependencies
+torch
+torchvision
+transformers>=4.51.0
+accelerate
+timm
+safetensors
+pillow
+opencv-python
+numpy
+
+# Optional fallback only
+ultralytics

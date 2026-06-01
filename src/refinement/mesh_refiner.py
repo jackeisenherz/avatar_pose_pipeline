@@ -1,5 +1,6 @@
+# Drop-in replacement for: src/refinement/mesh_refiner.py
+
 from pathlib import Path
-import json
 
 import cv2
 import numpy as np
@@ -9,60 +10,93 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from smplx_fit.renderer import SilhouetteRenderer
-from smplx_fit.body_regions import BodyRegionWeights
-from smplx_fit.losses import silhouette_loss
-from .laplacian import LaplacianRegularizer
 
 
 class MeshRefiner:
     """
-    Smooth normal-only mesh refinement with anti-bloating.
+    Safe, low-frequency contour refiner.
 
-    Positive scalar offset = outward expansion.
-    Negative scalar offset = inward contraction.
+    This refiner intentionally avoids aggressive freeform deformation. It learns
+    a very small scalar displacement field along the canonical vertex normals,
+    heavily smooths it, penalizes outward bloat, and writes debug overlays.
 
-    This version:
-    - uses normal-only scalar offsets,
-    - smooths offsets every iteration,
-    - scales camera focal length if refinement image_size differs from SMPL-X,
-    - uses conservative silhouette pressure,
-    - penalizes positive/outward offsets to avoid making the body fatter,
-    - logs full multiline diagnostics.
+    Interface-compatible with:
+        mesh_refiner.refine(
+            canonical_body_path=...,
+            image_paths=...,
+            visibility_paths=...,
+            output_path=...,
+            iterations=...
+        )
     """
 
     def __init__(
         self,
         image_size=512,
-        offset_limit=0.006,
-        lr=1e-4,
-        smooth_steps=6,
-        smooth_alpha=0.55,
-        final_smooth_steps=20,
+        device=None,
+        max_offset=0.0040,
+        smooth_steps=12,
+        smooth_alpha=0.75,
+        silhouette_weight=0.30,
+        distance_weight=8.0,
+        iou_weight=1.30,
+        edge_weight=0.05,
+        laplacian_weight=350.0,
+        offset_l2_weight=80.0,
+        outward_weight=120.0,
         debug=True,
         debug_every=25,
+        debug_max_images=6,
     ):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.image_size = int(image_size)
-        self.offset_limit = float(offset_limit)
-        self.lr = float(lr)
+        self.max_offset = float(max_offset)
         self.smooth_steps = int(smooth_steps)
         self.smooth_alpha = float(smooth_alpha)
-        self.final_smooth_steps = int(final_smooth_steps)
+
+        self.silhouette_weight = float(silhouette_weight)
+        self.distance_weight = float(distance_weight)
+        self.iou_weight = float(iou_weight)
+        self.edge_weight = float(edge_weight)
+        self.laplacian_weight = float(laplacian_weight)
+        self.offset_l2_weight = float(offset_l2_weight)
+        self.outward_weight = float(outward_weight)
+
         self.debug = bool(debug)
         self.debug_every = int(debug_every)
+        self.debug_max_images = int(debug_max_images)
 
-        print(f"✓ MeshRefiner device: {self.device}")
-        print(f"✓ Image size: {self.image_size}")
-        print(f"✓ Normal-only offset limit: ±{self.offset_limit}")
-        print(f"✓ LR: {self.lr}")
-        print(f"✓ Smooth steps / iter: {self.smooth_steps}")
-        print(f"✓ Final smooth steps: {self.final_smooth_steps}")
-        print(f"✓ Render debug: {self.debug}")
+        self.renderer = SilhouetteRenderer(
+            image_size=self.image_size,
+            device=self.device,
+        )
 
-        self.renderer = SilhouetteRenderer(image_size=self.image_size, device=self.device)
+        print(f"✓ Refiner device: {self.device}")
+        print(f"✓ Refiner max offset: ±{self.max_offset:.4f}")
 
-    def _load_target_mask(self, image_path):
+    # =========================================================
+    # IO
+    # =========================================================
+
+    def _load_npz(self, path):
+        data = np.load(path, allow_pickle=True)
+        return {k: data[k] for k in data.files}
+
+    def _as_vertices(self, arr):
+        arr = np.asarray(arr)
+        while arr.ndim > 2:
+            arr = arr[0]
+        return arr.astype(np.float32)
+
+    def _as_faces(self, arr):
+        arr = np.asarray(arr)
+        while arr.ndim > 2:
+            arr = arr[0]
+        return arr.astype(np.int64)
+
+    def _load_mask(self, image_path):
         rgba = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
+
         if rgba is None:
             raise RuntimeError(f"Could not load image: {image_path}")
 
@@ -73,54 +107,34 @@ class MeshRefiner:
             alpha = (gray > 5).astype(np.uint8) * 255
 
         mask = (alpha > 10).astype(np.float32)
-        mask = cv2.resize(mask, (self.image_size, self.image_size), interpolation=cv2.INTER_NEAREST)
-        return torch.tensor(mask, dtype=torch.float32, device=self.device).unsqueeze(0).unsqueeze(0)
+        mask = cv2.resize(
+            mask,
+            (self.image_size, self.image_size),
+            interpolation=cv2.INTER_NEAREST,
+        )
 
-    def _distance_maps_from_mask(self, mask_tensor):
-        mask_np = mask_tensor[0, 0].detach().cpu().numpy().astype(np.uint8)
-        fg = (mask_np > 0).astype(np.uint8)
+        return torch.tensor(
+            mask,
+            dtype=torch.float32,
+            device=self.device,
+        ).unsqueeze(0).unsqueeze(0)
 
-        dist_out = cv2.distanceTransform(1 - fg, cv2.DIST_L2, 5)
-        dist_in = cv2.distanceTransform(fg, cv2.DIST_L2, 5)
+    # =========================================================
+    # GEOMETRY
+    # =========================================================
 
-        dist_out = dist_out / max(float(dist_out.max()), 1e-6)
-        dist_in = dist_in / max(float(dist_in.max()), 1e-6)
-
-        dist_out = torch.tensor(dist_out, dtype=torch.float32, device=self.device).unsqueeze(0).unsqueeze(0)
-        dist_in = torch.tensor(dist_in, dtype=torch.float32, device=self.device).unsqueeze(0).unsqueeze(0)
-        return dist_out, dist_in
-
-    def _build_edges(self, faces):
-        f = faces.long()
-        edges = torch.cat([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]], dim=0)
+    def _build_edges(self, faces, num_vertices):
+        edges = torch.cat(
+            [
+                faces[:, [0, 1]],
+                faces[:, [1, 2]],
+                faces[:, [2, 0]],
+            ],
+            dim=0,
+        )
         edges = torch.sort(edges, dim=1).values
         edges = torch.unique(edges, dim=0)
-        return edges.to(self.device)
-
-    def _smooth_values(self, values, edges, steps=5, alpha=0.7):
-        if steps <= 0:
-            return values
-
-        out = values
-        src = edges[:, 0]
-        dst = edges[:, 1]
-
-        for _ in range(steps):
-            base = out[0]
-            sums = torch.zeros_like(base)
-            counts = torch.zeros(base.shape[0], 1, dtype=base.dtype, device=base.device)
-
-            sums.index_add_(0, src, base[dst])
-            sums.index_add_(0, dst, base[src])
-
-            ones = torch.ones(src.shape[0], 1, dtype=base.dtype, device=base.device)
-            counts.index_add_(0, src, ones)
-            counts.index_add_(0, dst, ones)
-
-            neighbor_mean = sums / counts.clamp(min=1.0)
-            out = ((1.0 - alpha) * base + alpha * neighbor_mean).unsqueeze(0)
-
-        return out
+        return edges.long()
 
     def _vertex_normals(self, vertices, faces):
         v = vertices[0]
@@ -140,318 +154,354 @@ class MeshRefiner:
         normals = F.normalize(normals, dim=-1, eps=1e-8)
         return normals.unsqueeze(0)
 
-    def _distance_silhouette_loss(self, rendered_mask, target_mask, dist_out, dist_in):
-        false_positive = rendered_mask * (1.0 - target_mask)
-        false_negative = target_mask * (1.0 - rendered_mask)
-        fp_loss = (false_positive * dist_out).mean()
-        fn_loss = (false_negative * dist_in).mean()
-        return fp_loss + 0.20 * fn_loss
+    def _smooth_scalars(self, scalars, edges, steps=None, alpha=None):
+        steps = self.smooth_steps if steps is None else int(steps)
+        alpha = self.smooth_alpha if alpha is None else float(alpha)
 
-    def _iou_loss(self, rendered_mask, target_mask, eps=1e-6):
-        intersection = (rendered_mask * target_mask).sum(dim=(1, 2, 3))
-        union = (rendered_mask + target_mask - rendered_mask * target_mask).sum(dim=(1, 2, 3))
+        if steps <= 0:
+            return scalars
+
+        out = scalars
+        src = edges[:, 0]
+        dst = edges[:, 1]
+
+        for _ in range(steps):
+            base = out[0]
+            sums = torch.zeros_like(base)
+            counts = torch.zeros(
+                base.shape[0],
+                1,
+                dtype=base.dtype,
+                device=base.device,
+            )
+
+            sums.index_add_(0, src, base[dst])
+            sums.index_add_(0, dst, base[src])
+
+            ones = torch.ones(
+                src.shape[0],
+                1,
+                dtype=base.dtype,
+                device=base.device,
+            )
+
+            counts.index_add_(0, src, ones)
+            counts.index_add_(0, dst, ones)
+
+            neighbor_mean = sums / counts.clamp(min=1.0)
+            out = ((1.0 - alpha) * base + alpha * neighbor_mean).unsqueeze(0)
+
+        return out
+
+    # =========================================================
+    # LOSSES
+    # =========================================================
+
+    def _distance_maps_from_mask(self, mask_tensor):
+        mask_np = mask_tensor[0, 0].detach().cpu().numpy().astype(np.uint8)
+        fg = (mask_np > 0).astype(np.uint8)
+
+        dist_out = cv2.distanceTransform(1 - fg, cv2.DIST_L2, 5)
+        dist_in = cv2.distanceTransform(fg, cv2.DIST_L2, 5)
+
+        dist_out = dist_out / max(float(dist_out.max()), 1e-6)
+        dist_in = dist_in / max(float(dist_in.max()), 1e-6)
+
+        return (
+            torch.tensor(dist_out, dtype=torch.float32, device=self.device).unsqueeze(0).unsqueeze(0),
+            torch.tensor(dist_in, dtype=torch.float32, device=self.device).unsqueeze(0).unsqueeze(0),
+        )
+
+    def _silhouette_loss(self, rendered, target):
+        return torch.abs(rendered - target).mean()
+
+    def _distance_loss(self, rendered, target, dist_out, dist_in):
+        false_positive = rendered * (1.0 - target)
+        false_negative = target * (1.0 - rendered)
+        return (false_positive * dist_out).mean() + 0.25 * (false_negative * dist_in).mean()
+
+    def _iou_loss(self, rendered, target, eps=1e-6):
+        intersection = (rendered * target).sum(dim=(1, 2, 3))
+        union = (rendered + target - rendered * target).sum(dim=(1, 2, 3))
         return 1.0 - ((intersection + eps) / (union + eps)).mean()
 
-    def _edge_loss(self, rendered_mask, target_mask):
-        kernel_x = torch.tensor([[[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]], dtype=torch.float32, device=self.device).unsqueeze(0)
-        kernel_y = torch.tensor([[[-1, -2, -1], [0, 0, 0], [1, 2, 1]]], dtype=torch.float32, device=self.device).unsqueeze(0)
+    def _edge_loss(self, rendered, target):
+        kernel_x = torch.tensor(
+            [[[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]],
+            dtype=torch.float32,
+            device=self.device,
+        ).unsqueeze(0)
 
-        pred_x = F.conv2d(rendered_mask, kernel_x, padding=1)
-        pred_y = F.conv2d(rendered_mask, kernel_y, padding=1)
-        tgt_x = F.conv2d(target_mask, kernel_x, padding=1)
-        tgt_y = F.conv2d(target_mask, kernel_y, padding=1)
+        kernel_y = torch.tensor(
+            [[[-1, -2, -1], [0, 0, 0], [1, 2, 1]]],
+            dtype=torch.float32,
+            device=self.device,
+        ).unsqueeze(0)
 
-        pred_edge = torch.sqrt(pred_x ** 2 + pred_y ** 2 + 1e-6)
-        tgt_edge = torch.sqrt(tgt_x ** 2 + tgt_y ** 2 + 1e-6)
-        return torch.abs(pred_edge - tgt_edge).mean()
+        px = F.conv2d(rendered, kernel_x, padding=1)
+        py = F.conv2d(rendered, kernel_y, padding=1)
+        tx = F.conv2d(target, kernel_x, padding=1)
+        ty = F.conv2d(target, kernel_y, padding=1)
 
-    def _load_scaled_camera(self, data):
-        canonical_image_size = self.image_size
-        if "image_size" in data.files:
-            saved_size = np.asarray(data["image_size"]).reshape(-1)
-            if len(saved_size) > 0:
-                canonical_image_size = int(saved_size[0])
+        pe = torch.sqrt(px ** 2 + py ** 2 + 1e-6)
+        te = torch.sqrt(tx ** 2 + ty ** 2 + 1e-6)
 
-        scale = float(self.image_size) / float(canonical_image_size)
+        return torch.abs(pe - te).mean()
 
-        focal_np = data["focal_length"] if "focal_length" in data.files else np.array([[1500.0, 1500.0]], dtype=np.float32)
-        focal_np = np.asarray(focal_np, dtype=np.float32).reshape(1, 2)
-        focal_np *= scale
+    def _laplacian_scalar_loss(self, scalars, edges):
+        src = edges[:, 0]
+        dst = edges[:, 1]
+        return ((scalars[:, src] - scalars[:, dst]) ** 2).mean()
 
-        focal_length = torch.tensor(focal_np, dtype=torch.float32, device=self.device)
-        camera_center = torch.tensor([[self.image_size / 2.0, self.image_size / 2.0]], dtype=torch.float32, device=self.device)
+    def _outward_bloat_loss(self, scalars):
+        return (torch.relu(scalars) ** 2).mean()
 
-        print(
-            f"✓ Refiner camera scale: canonical={canonical_image_size}, "
-            f"refine={self.image_size}, scale={scale:.4f}, "
-            f"focal=({focal_length[0,0].item():.2f}, {focal_length[0,1].item():.2f})"
-        )
-        return focal_length, camera_center
+    # =========================================================
+    # DEBUG
+    # =========================================================
 
-    def _save_mask_debug(self, rendered_mask, target_mask, out_path):
-        pred = rendered_mask[0, 0].detach().cpu().numpy()
-        tgt = target_mask[0, 0].detach().cpu().numpy()
+    def _save_debug(self, debug_dir, iteration, image_index, target_mask, rendered_mask):
+        if not self.debug:
+            return
 
-        pred = (pred > 0.5).astype(np.uint8) * 255
-        tgt = (tgt > 0.5).astype(np.uint8) * 255
+        debug_dir.mkdir(parents=True, exist_ok=True)
 
-        overlay = np.zeros((pred.shape[0], pred.shape[1], 3), dtype=np.uint8)
-        overlay[:, :, 1] = tgt
-        overlay[:, :, 2] = pred
+        target = target_mask[0, 0].detach().cpu().numpy()
+        render = rendered_mask[0, 0].detach().cpu().numpy()
 
-        out_path = Path(out_path)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(out_path), overlay)
+        target = (target > 0.5).astype(np.uint8)
+        render = (render > 0.5).astype(np.uint8)
 
-    def _export_obj(self, vertices, faces, obj_path):
-        vertices = np.asarray(vertices)
-        faces = np.asarray(faces)
+        img = np.zeros((target.shape[0], target.shape[1], 3), dtype=np.uint8)
 
-        while vertices.ndim > 2:
-            vertices = vertices[0]
+        overlap = (target == 1) & (render == 1)
+        target_only = (target == 1) & (render == 0)
+        render_only = (target == 0) & (render == 1)
 
-        while faces.ndim > 2:
-            faces = faces[0]
+        img[target_only] = [0, 255, 0]
+        img[render_only] = [255, 0, 0]
+        img[overlap] = [255, 255, 0]
 
-        vertices = vertices.astype(np.float32)
-        faces = faces.astype(np.int32)
+        out_path = debug_dir / f"refine_iter_{iteration:04d}_img_{image_index:03d}.png"
+        cv2.imwrite(str(out_path), cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
 
-        if np.isnan(vertices).any() or np.isinf(vertices).any():
-            raise RuntimeError("Cannot export OBJ: vertices contain NaN or Inf")
+    # =========================================================
+    # MAIN
+    # =========================================================
 
-        obj_path = Path(obj_path)
-        obj_path.parent.mkdir(parents=True, exist_ok=True)
-
-        with open(obj_path, "w") as f:
-            for v in vertices:
-                f.write(f"v {v[0]} {v[1]} {v[2]}\n")
-            for tri in faces:
-                a, b, c = tri + 1
-                f.write(f"f {int(a)} {int(b)} {int(c)}\n")
-
-        print(f"✅ OBJ exported: {obj_path}")
-
-    def refine(self, canonical_body_path, image_paths=None, visibility_paths=None, output_path=None, iterations=300):
-        print("\n🚀 Starting anti-bloat smooth normal-only refinement")
+    def refine(
+        self,
+        canonical_body_path,
+        image_paths,
+        visibility_paths,
+        output_path,
+        iterations=300,
+    ):
+        print("\n🚀 Starting safe low-frequency refinement")
 
         canonical_body_path = Path(canonical_body_path)
-        data = np.load(canonical_body_path, allow_pickle=True)
-
-        required = ["vertices", "faces", "per_image_vertices", "translations"]
-        missing = [k for k in required if k not in data.files]
-        if missing:
-            raise RuntimeError(f"canonical_body.npz is missing refinement fields: {missing}. Re-run multi-image optimization first.")
-
-        base_vertices = torch.tensor(data["vertices"], dtype=torch.float32, device=self.device)
-        if base_vertices.dim() == 2:
-            base_vertices = base_vertices.unsqueeze(0)
-
-        faces = torch.tensor(data["faces"], dtype=torch.long, device=self.device)
-        if faces.dim() == 3:
-            faces = faces[0]
-
-        faces_render = faces.unsqueeze(0)
-        edges = self._build_edges(faces)
-
-        per_image_vertices = torch.tensor(data["per_image_vertices"], dtype=torch.float32, device=self.device)
-        translations = torch.tensor(data["translations"], dtype=torch.float32, device=self.device)
-
-        if per_image_vertices.dim() != 3:
-            raise RuntimeError("Expected per_image_vertices with shape [N, V, 3]")
-
-        num_images, num_vertices, _ = per_image_vertices.shape
-
-        if image_paths is None and "image_paths" in data.files:
-            image_paths = [Path(str(p)) for p in data["image_paths"]]
-        if visibility_paths is None and "visibility_json_paths" in data.files:
-            visibility_paths = [Path(str(p)) for p in data["visibility_json_paths"]]
-        if image_paths is None or visibility_paths is None:
-            raise RuntimeError("image_paths and visibility_paths must be passed, or saved in canonical_body.npz")
-
-        image_paths = [Path(p) for p in image_paths]
-        visibility_paths = [Path(p) for p in visibility_paths]
-
-        if len(image_paths) != num_images:
-            raise RuntimeError(f"image_paths length {len(image_paths)} does not match per_image_vertices {num_images}")
-        if len(visibility_paths) != num_images:
-            raise RuntimeError(f"visibility_paths length {len(visibility_paths)} does not match per_image_vertices {num_images}")
-
-        if output_path is None:
-            output_path = canonical_body_path.parent / "refined_body.npz"
         output_path = Path(output_path)
         debug_dir = output_path.parent / "_render_debug"
 
-        focal_length, camera_center = self._load_scaled_camera(data)
+        payload = self._load_npz(canonical_body_path)
 
-        masks, dist_out_all, dist_in_all, metadata_all = [], [], [], []
-        for img_path, vis_path in zip(image_paths, visibility_paths):
-            mask = self._load_target_mask(img_path)
-            masks.append(mask)
+        neutral_vertices_np = self._as_vertices(payload["vertices"])
+        faces_np = self._as_faces(payload["faces"])
 
-            dist_out, dist_in = self._distance_maps_from_mask(mask)
-            dist_out_all.append(dist_out)
-            dist_in_all.append(dist_in)
+        faces = torch.tensor(
+            faces_np,
+            dtype=torch.long,
+            device=self.device,
+        )
 
-            with open(vis_path, "r") as f:
-                metadata_all.append(json.load(f))
+        neutral_vertices = torch.tensor(
+            neutral_vertices_np,
+            dtype=torch.float32,
+            device=self.device,
+        ).unsqueeze(0)
 
-        normals = self._vertex_normals(base_vertices, faces).detach()
+        if "per_image_vertices" in payload:
+            per_image_vertices_np = payload["per_image_vertices"].astype(np.float32)
+        else:
+            per_image_vertices_np = np.repeat(
+                neutral_vertices_np[None, :, :],
+                len(image_paths),
+                axis=0,
+            )
 
-        offset_scalars = nn.Parameter(torch.zeros(1, num_vertices, 1, device=self.device))
-        optimizer = torch.optim.Adam([offset_scalars], lr=self.lr)
-        laplacian = LaplacianRegularizer(faces, device=self.device)
+        per_image_vertices = torch.tensor(
+            per_image_vertices_np,
+            dtype=torch.float32,
+            device=self.device,
+        )
 
-        progress = tqdm(range(iterations), desc="Refining", dynamic_ncols=True, leave=True)
+        translations = torch.tensor(
+            payload.get(
+                "translations",
+                np.tile(np.array([[0.0, 0.0, 5.0]], dtype=np.float32), (len(image_paths), 1)),
+            ),
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        focal = payload.get("focal_length", np.array([[1500.0, 1500.0]], dtype=np.float32))
+        focal = torch.tensor(focal, dtype=torch.float32, device=self.device)
+
+        if focal.ndim == 1:
+            focal = focal.view(1, 2)
+
+        camera_center = payload.get(
+            "camera_center",
+            np.array([[self.image_size / 2.0, self.image_size / 2.0]], dtype=np.float32),
+        )
+
+        camera_center = torch.tensor(
+            camera_center,
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        if camera_center.ndim == 1:
+            camera_center = camera_center.view(1, 2)
+
+        masks = [self._load_mask(p) for p in image_paths]
+        dist_maps = [self._distance_maps_from_mask(m) for m in masks]
+
+        edges = self._build_edges(faces, neutral_vertices.shape[1])
+        normals = self._vertex_normals(neutral_vertices, faces)
+
+        scalar_offsets = nn.Parameter(
+            torch.zeros(
+                1,
+                neutral_vertices.shape[1],
+                1,
+                dtype=torch.float32,
+                device=self.device,
+            )
+        )
+
+        optimizer = torch.optim.Adam([scalar_offsets], lr=0.003)
+
+        progress = tqdm(range(iterations), desc="Refining", dynamic_ncols=True)
+
+        last = {}
 
         for iteration in progress:
             optimizer.zero_grad()
 
-            offset_scalars_clamped = torch.clamp(offset_scalars, -self.offset_limit, self.offset_limit)
-            offset_scalars_smooth = self._smooth_values(
-                offset_scalars_clamped,
-                edges,
-                steps=self.smooth_steps,
-                alpha=self.smooth_alpha,
+            raw_scalars = torch.clamp(
+                scalar_offsets,
+                -self.max_offset,
+                self.max_offset,
             )
 
-            vertex_offsets = normals * offset_scalars_smooth
-            total_loss = 0.0
-            last = {}
+            smooth_scalars = self._smooth_scalars(raw_scalars, edges)
+            vertex_offsets = normals * smooth_scalars
 
-            for i in range(num_images):
-                vertices_i = per_image_vertices[i:i + 1] + vertex_offsets
+            total_loss = torch.tensor(0.0, device=self.device)
+
+            for i in range(len(image_paths)):
+                verts = per_image_vertices[i:i + 1] + vertex_offsets
 
                 rendered = self.renderer.render(
-                    vertices=vertices_i,
-                    faces=faces_render,
-                    focal_length=focal_length,
+                    vertices=verts,
+                    faces=faces.unsqueeze(0),
+                    focal_length=focal,
                     principal_point=camera_center,
                     translation=translations[i:i + 1],
                 )
 
                 rendered_mask = rendered[..., 3].unsqueeze(1)
-                metadata = metadata_all[i]
 
-                visibility_mask = torch.ones_like(masks[i])
-                border = int(self.image_size * 0.12)
+                target_mask = masks[i]
+                dist_out, dist_in = dist_maps[i]
 
-                if metadata.get("truncated_top", False):
-                    visibility_mask[:, :, :border, :] *= 0.4
-                if metadata.get("truncated_bottom", False):
-                    visibility_mask[:, :, -border:, :] *= 0.4
-                if metadata.get("truncated_left", False):
-                    visibility_mask[:, :, :, :border] *= 0.4
-                if metadata.get("truncated_right", False):
-                    visibility_mask[:, :, :, -border:] *= 0.4
+                loss_sil = self._silhouette_loss(rendered_mask, target_mask)
+                loss_dist = self._distance_loss(rendered_mask, target_mask, dist_out, dist_in)
+                loss_iou = self._iou_loss(rendered_mask, target_mask)
+                loss_edge = self._edge_loss(rendered_mask, target_mask)
 
-                region_weights = BodyRegionWeights.create_weight_map(
-                    height=self.image_size,
-                    width=self.image_size,
-                    device=self.device,
+                image_loss = (
+                    self.silhouette_weight * loss_sil +
+                    self.distance_weight * loss_dist +
+                    self.iou_weight * loss_iou +
+                    self.edge_weight * loss_edge
                 )
 
-                if region_weights.dim() == 3:
-                    region_weights = region_weights.unsqueeze(0)
+                total_loss = total_loss + image_loss
 
-                chest_boost = 1.0 + float(metadata.get("chest_visible", 0.0)) * 0.08
-                hip_boost = 1.0 + float(metadata.get("hip_visible", 0.0)) * 0.08
-                region_weights = region_weights * chest_boost * hip_boost
+                last = {
+                    "sil": loss_sil,
+                    "dist": loss_dist,
+                    "iou": loss_iou,
+                    "edge": loss_edge,
+                }
 
-                loss_sil = silhouette_loss(rendered_mask, masks[i], visibility_mask, region_weights)
-                loss_dist = self._distance_silhouette_loss(rendered_mask, masks[i], dist_out_all[i], dist_in_all[i])
-                loss_iou = self._iou_loss(rendered_mask, masks[i])
-                loss_edge = self._edge_loss(rendered_mask, masks[i])
+                if self.debug and (iteration % self.debug_every == 0 or iteration == iterations - 1) and i < self.debug_max_images:
+                    self._save_debug(
+                        debug_dir=debug_dir,
+                        iteration=iteration,
+                        image_index=i,
+                        target_mask=target_mask,
+                        rendered_mask=rendered_mask,
+                    )
 
-                image_weight = float(metadata.get("image_weight", 1.0))
-                total_loss = total_loss + image_weight * (
-                    0.08 * loss_sil +
-                    3.00 * loss_dist +
-                    0.45 * loss_iou +
-                    0.03 * loss_edge
-                )
+            loss_lap = self._laplacian_scalar_loss(smooth_scalars, edges)
+            loss_l2 = (smooth_scalars ** 2).mean()
+            loss_outward = self._outward_bloat_loss(smooth_scalars)
 
-                if self.debug and i == 0 and iteration % self.debug_every == 0:
-                    self._save_mask_debug(rendered_mask, masks[i], debug_dir / f"iter_{iteration:04d}_img_{i:03d}.png")
-
-                last = {"sil": loss_sil, "dist": loss_dist, "iou": loss_iou, "edge": loss_edge}
-
-            loss_lap_xyz = laplacian.offset_loss(vertex_offsets)
-            loss_lap_scalar = laplacian.offset_loss(offset_scalars_smooth)
-            loss_offset = (offset_scalars_smooth ** 2).mean()
-            loss_raw_offset = (offset_scalars_clamped ** 2).mean()
-
-            positive_offsets = torch.relu(offset_scalars_smooth)
-            loss_outward = positive_offsets.mean()
-            loss_outward_sq = (positive_offsets ** 2).mean()
-
-            total = (
-                total_loss +
-                60.0 * loss_lap_xyz +
-                120.0 * loss_lap_scalar +
-                150.0 * loss_offset +
-                25.0 * loss_raw_offset +
-                80.0 * loss_outward +
-                300.0 * loss_outward_sq
+            total_loss = total_loss + (
+                self.laplacian_weight * loss_lap +
+                self.offset_l2_weight * loss_l2 +
+                self.outward_weight * loss_outward
             )
 
-            total.backward()
+            total_loss.backward()
             optimizer.step()
 
             with torch.no_grad():
-                offset_scalars.clamp_(-self.offset_limit, self.offset_limit)
-                smoothed_param = self._smooth_values(offset_scalars, edges, steps=self.smooth_steps, alpha=self.smooth_alpha)
-                offset_scalars.copy_(torch.clamp(smoothed_param, -self.offset_limit, self.offset_limit))
-
-            if iteration % 10 == 0:
-                progress.set_postfix({
-                    "total": f"{total.item():.2f}",
-                    "iou": f"{last.get('iou', torch.tensor(0.0)).item():.4f}",
-                    "sil": f"{last.get('sil', torch.tensor(0.0)).item():.4f}",
-                })
+                scalar_offsets.clamp_(-self.max_offset, self.max_offset)
 
             if iteration % 25 == 0:
                 tqdm.write(
-                    "\n"
-                    f"[anti-bloat refine iter {iteration:04d}]\n"
-                    f"  total:        {total.item():.6f}\n"
-                    f"  sil:          {last.get('sil', torch.tensor(0.0)).item():.6f}\n"
-                    f"  dist:         {last.get('dist', torch.tensor(0.0)).item():.6f}\n"
-                    f"  iou:          {last.get('iou', torch.tensor(0.0)).item():.6f}\n"
-                    f"  edge:         {last.get('edge', torch.tensor(0.0)).item():.6f}\n"
-                    f"  lap_xyz:      {loss_lap_xyz.item():.8f}\n"
-                    f"  lap_scalar:   {loss_lap_scalar.item():.8f}\n"
-                    f"  off_smooth:   {loss_offset.item():.8f}\n"
-                    f"  off_raw:      {loss_raw_offset.item():.8f}\n"
-                    f"  outward:      {loss_outward.item():.8f}\n"
-                    f"  outward_sq:   {loss_outward_sq.item():.8f}\n"
-                    f"  clamp:        ±{self.offset_limit:.4f}\n"
+                    f"\n[safe refine iter {iteration:04d}]\n"
+                    f"  total:      {total_loss.item():.6f}\n"
+                    f"  sil:        {last.get('sil', torch.tensor(0.0)).item():.6f}\n"
+                    f"  dist:       {last.get('dist', torch.tensor(0.0)).item():.6f}\n"
+                    f"  iou:        {last.get('iou', torch.tensor(0.0)).item():.6f}\n"
+                    f"  edge:       {last.get('edge', torch.tensor(0.0)).item():.6f}\n"
+                    f"  lap:        {loss_lap.item():.8f}\n"
+                    f"  off_l2:     {loss_l2.item():.8f}\n"
+                    f"  outward:    {loss_outward.item():.8f}\n"
+                    f"  clamp:      ±{self.max_offset:.4f}"
                 )
 
+            progress.set_postfix({
+                "total": f"{total_loss.item():.2f}",
+                "iou": f"{last.get('iou', torch.tensor(0.0)).item():.4f}",
+                "sil": f"{last.get('sil', torch.tensor(0.0)).item():.4f}",
+            })
+
         with torch.no_grad():
-            final_scalars = torch.clamp(offset_scalars, -self.offset_limit, self.offset_limit)
-            final_scalars = self._smooth_values(final_scalars, edges, steps=self.final_smooth_steps, alpha=self.smooth_alpha)
-            final_scalars = torch.clamp(final_scalars, -self.offset_limit, self.offset_limit)
-
+            final_scalars = self._smooth_scalars(
+                torch.clamp(scalar_offsets, -self.max_offset, self.max_offset),
+                edges,
+            )
             final_offsets = normals * final_scalars
-            final_vertices = base_vertices + final_offsets
+            refined_vertices = neutral_vertices + final_offsets
+            refined_per_image_vertices = per_image_vertices + final_offsets
 
-        result = {
-            "vertices": final_vertices.detach().cpu().numpy(),
-            "faces": faces.detach().cpu().numpy(),
-            "offsets": final_offsets.detach().cpu().numpy(),
-            "offset_scalars": final_scalars.detach().cpu().numpy(),
-            "source_canonical": str(canonical_body_path),
-            "num_images": num_images,
-            "image_size": np.array([self.image_size], dtype=np.int32),
-            "focal_length": focal_length.detach().cpu().numpy(),
-            "camera_center": camera_center.detach().cpu().numpy(),
-        }
+        result = dict(payload)
+        result["vertices"] = refined_vertices.detach().cpu().numpy()
+        result["faces"] = faces_np
+        result["refinement_offsets"] = final_offsets.detach().cpu().numpy()
+        result["refinement_scalar_offsets"] = final_scalars.detach().cpu().numpy()
+        result["per_image_vertices"] = refined_per_image_vertices.detach().cpu().numpy()
+        result["refinement_max_offset"] = np.array([self.max_offset], dtype=np.float32)
+        result["refinement_method"] = np.array(["safe_low_frequency_normal_offsets"])
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         np.savez(output_path, **result)
 
-        obj_path = output_path.with_suffix(".obj")
-        self._export_obj(result["vertices"], result["faces"], obj_path)
-
-        print(f"\n✅ Refined mesh saved:\n{output_path}")
+        print(f"✅ Refined body saved: {output_path}")
         return result
