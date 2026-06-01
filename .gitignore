@@ -26,4 +26,5 @@ Thumbs.db
 *.deb
 /models/
 /data/
+/external/
 pytorch3d/Miniconda3-latest-Linux-x86_64.sh
