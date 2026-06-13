@@ -7,10 +7,18 @@ from pathlib import Path
 from urllib.request import urlretrieve
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+_BOOTSTRAP_FILE = Path(__file__).resolve()
+# bootstrap.py may live either in the project root or in src/.
+# Use the repository root so external/DECA is not
+# accidentally created under src/external, which would cause repeated clones
+# and repeated model downloads.
+if _BOOTSTRAP_FILE.parent.name == "src":
+    PROJECT_ROOT = _BOOTSTRAP_FILE.parents[1]
+else:
+    PROJECT_ROOT = _BOOTSTRAP_FILE.parent
+
 EXTERNAL_DIR = PROJECT_ROOT / "external"
 DECA_DIR = EXTERNAL_DIR / "DECA"
-
 DECA_REPO = "https://github.com/YadiraF/DECA.git"
 
 GENERIC_MODEL_URL = (
@@ -191,7 +199,7 @@ def ensure_mediapipe_installed():
                 "Rename/remove it: " + path
             )
 
-        raise RuntimeError(
+        message = (
             "MediaPipe installed, but mediapipe.solutions is still unavailable.\n"
             f"Before repair: {before}\n"
             f"After repair:  {after}\n"
@@ -205,6 +213,16 @@ def ensure_mediapipe_installed():
             "  PY"
             f"{project_shadow}"
         )
+
+        # The current pipeline can run with the newer ViTPose-based pose path
+        # and does not need to hard-fail here. Set AVATAR_REQUIRE_MEDIAPIPE=1
+        # if you want the older strict behavior.
+        if os.environ.get("AVATAR_REQUIRE_MEDIAPIPE", "0") == "1":
+            raise RuntimeError(message)
+
+        print("⚠ " + message.replace("\n", "\n  "))
+        print("⚠ Continuing without MediaPipe Solutions API. Set AVATAR_REQUIRE_MEDIAPIPE=1 to make this fatal.")
+        return False
 
     info = mediapipe_debug_info()
     print(f"✅ MediaPipe repaired: {info.get('version')} at {info.get('path')}")
@@ -623,6 +641,7 @@ def ensure_deca_models():
     download_if_missing(DECA_MODEL_URL, deca_model, min_bytes=min_deca)
 
 
+
 def ensure_dependencies():
     print("🔧 Checking dependencies...")
     ensure_legacy_numpy_inspect_compat()
@@ -709,6 +728,7 @@ def ensure_dependencies():
     install_deca_python_dependencies()
     ensure_deca_models()
     patch_deca_demo_reconstruct()
+
 
     import torch
     print("✅ Dependencies checked.")

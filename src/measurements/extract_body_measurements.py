@@ -1,22 +1,34 @@
 #!/usr/bin/env python3
 """
-Extract body and bust measurements from canonical/refined SMPL-X NPZ.
+Extract body, bust, chest-landmark and body-ratio measurements from canonical/refined SMPL-X NPZ.
 
 Input:
     data/output/08_smplx/canonical_body.npz
     or
     data/output/09_refined/refined_body.npz
 
-Required:
-    --height-cm known real model height in centimeters
+Optional:
+    visibility JSON directory produced by the improved VisibilityAnalyzer.
+    These JSONs may include:
+        chest_analysis.left_nipple
+        chest_analysis.right_nipple
+        chest_analysis.left_areola_diameter_px
+        chest_analysis.right_areola_diameter_px
+        chest_analysis.left_imf_curve
+        chest_analysis.right_imf_curve
+        chest_analysis.sternum_midline
+        chest_analysis.cleavage
+
+Height:
+    --height-cm is optional. If omitted, 165 cm is assumed.
 
 Output:
     JSON with requested measurements.
 
 Important:
-    Bust-specific values are geometric estimates from the fitted mesh.
-    They are not clinical or scan-grade measurements unless the mesh has
-    accurate nipple/IMF/sternal-notch landmarks.
+    Bust-specific values are geometric estimates from the fitted mesh and/or
+    fused image-derived chest landmarks. They are not clinical measurements
+    unless the mesh and landmarks are scan-grade.
 """
 
 from __future__ import annotations
@@ -24,7 +36,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, Any, Iterable, List
 
 import numpy as np
 
@@ -80,7 +92,6 @@ def _surface_area(vertices: np.ndarray, faces: np.ndarray, vertex_mask: np.ndarr
     selected = faces[fmask]
 
     total = 0.0
-
     for tri in selected:
         total += _triangle_area(vertices[tri[0]], vertices[tri[1]], vertices[tri[2]])
 
@@ -102,14 +113,12 @@ def _convex_hull_2d(points: np.ndarray) -> np.ndarray:
         )
 
     lower = []
-
     for p in points:
         while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
             lower.pop()
         lower.append(p)
 
     upper = []
-
     for p in points[::-1]:
         while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
             upper.pop()
@@ -170,6 +179,34 @@ def _circumference_at_y(vertices: np.ndarray, faces: np.ndarray, y_plane: float)
     return _perimeter(pts)
 
 
+def _best_circumference_in_band(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    y_min: float,
+    y_max: float,
+    mode: str,
+    samples: int = 48,
+) -> Tuple[float, float]:
+    best_val = None
+    best_y = None
+    for y in np.linspace(y_min, y_max, samples):
+        c = _circumference_at_y(vertices, faces, float(y))
+        if c <= 0:
+            continue
+        if best_val is None:
+            best_val = c
+            best_y = float(y)
+        elif mode == "max" and c > best_val:
+            best_val = c
+            best_y = float(y)
+        elif mode == "min" and c < best_val:
+            best_val = c
+            best_y = float(y)
+    if best_val is None:
+        return 0.0, float(0.5 * (y_min + y_max))
+    return float(best_val), float(best_y)
+
+
 def _fit_plane_xy_to_z(points: np.ndarray) -> Tuple[float, float, float]:
     """
     Fit z = ax + by + c.
@@ -187,6 +224,290 @@ def _fit_plane_xy_to_z(points: np.ndarray) -> Tuple[float, float, float]:
 def _plane_eval(coef: Tuple[float, float, float], x: np.ndarray, y: np.ndarray) -> np.ndarray:
     a, b, c = coef
     return a * x + b * y + c
+
+
+# ============================================================
+# JSON / LANDMARK HELPERS
+# ============================================================
+
+def _safe_float(v: Any, default: Optional[float] = None) -> Optional[float]:
+    try:
+        if v is None:
+            return default
+        x = float(v)
+        if not np.isfinite(x):
+            return default
+        return x
+    except Exception:
+        return default
+
+
+def _weighted_mean(values: List[float], weights: List[float]) -> Optional[float]:
+    pairs = [(float(v), max(float(w), 1e-6)) for v, w in zip(values, weights) if v is not None and np.isfinite(v)]
+    if not pairs:
+        return None
+    vals = np.asarray([p[0] for p in pairs], dtype=np.float64)
+    ww = np.asarray([p[1] for p in pairs], dtype=np.float64)
+    return float((vals * ww).sum() / max(float(ww.sum()), 1e-8))
+
+
+def _weighted_median(values: List[float], weights: List[float]) -> Optional[float]:
+    pairs = [(float(v), max(float(w), 1e-6)) for v, w in zip(values, weights) if v is not None and np.isfinite(v)]
+    if not pairs:
+        return None
+    vals = np.asarray([p[0] for p in pairs], dtype=np.float64)
+    ww = np.asarray([p[1] for p in pairs], dtype=np.float64)
+    idx = np.argsort(vals)
+    vals = vals[idx]
+    ww = ww[idx]
+    cum = np.cumsum(ww)
+    cutoff = 0.5 * ww.sum()
+    return float(vals[np.searchsorted(cum, cutoff)])
+
+
+def _point_visible(p: Dict[str, Any]) -> bool:
+    return bool(p and p.get("visible", False) and p.get("x") is not None and p.get("y") is not None)
+
+
+def _point_xy(p: Dict[str, Any]) -> Optional[np.ndarray]:
+    if not _point_visible(p):
+        return None
+    x = _safe_float(p.get("x"))
+    y = _safe_float(p.get("y"))
+    if x is None or y is None:
+        return None
+    return np.asarray([x, y], dtype=np.float64)
+
+
+def _dist2d(a: Dict[str, Any], b: Dict[str, Any]) -> Optional[float]:
+    aa = _point_xy(a)
+    bb = _point_xy(b)
+    if aa is None or bb is None:
+        return None
+    return float(np.linalg.norm(aa - bb))
+
+
+def _point_to_curve_distance_px(point: Dict[str, Any], curve: Dict[str, Any]) -> Optional[float]:
+    p = _point_xy(point)
+    if p is None or not curve or not curve.get("visible", False):
+        return None
+    pts = []
+    for q in curve.get("points", []):
+        if len(q) >= 2:
+            x, y = _safe_float(q[0]), _safe_float(q[1])
+            if x is not None and y is not None:
+                pts.append([x, y])
+    if not pts:
+        return None
+    arr = np.asarray(pts, dtype=np.float64)
+    return float(np.min(np.linalg.norm(arr - p[None, :], axis=1)))
+
+
+def _point_to_sternal_notch_px(point: Dict[str, Any], sternum_curve: Dict[str, Any]) -> Optional[float]:
+    p = _point_xy(point)
+    if p is None or not sternum_curve or not sternum_curve.get("visible", False):
+        return None
+    pts = []
+    for q in sternum_curve.get("points", []):
+        if len(q) >= 2:
+            x, y = _safe_float(q[0]), _safe_float(q[1])
+            if x is not None and y is not None:
+                pts.append([x, y])
+    if not pts:
+        return None
+    arr = np.asarray(pts, dtype=np.float64)
+    # Topmost sternum point is used as sternal-notch proxy.
+    notch = arr[np.argmin(arr[:, 1])]
+    return float(np.linalg.norm(p - notch))
+
+
+def _load_json(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _pose_pixel_height(pose_json: Optional[Dict[str, Any]]) -> Optional[float]:
+    if not pose_json:
+        return None
+    ys = []
+    for kp in pose_json.get("keypoints", []):
+        if isinstance(kp, dict):
+            c = _safe_float(kp.get("confidence"), 0.0)
+            y = _safe_float(kp.get("y"))
+        else:
+            c = _safe_float(kp[2] if len(kp) > 2 else 0.0, 0.0)
+            y = _safe_float(kp[1] if len(kp) > 1 else None)
+        if c is not None and c > 0.35 and y is not None:
+            ys.append(float(y))
+    if len(ys) < 2:
+        return None
+    return float(max(ys) - min(ys))
+
+
+def _visibility_pixel_height(vis_json: Dict[str, Any], pose_json: Optional[Dict[str, Any]]) -> Optional[float]:
+    bbox = vis_json.get("bbox", {})
+    y1, y2 = _safe_float(bbox.get("y1")), _safe_float(bbox.get("y2"))
+    if y1 is not None and y2 is not None and y2 > y1:
+        return float(y2 - y1)
+    return _pose_pixel_height(pose_json)
+
+
+def _matching_pose_json(visibility_path: Path, pose_dir: Optional[Path]) -> Optional[Dict[str, Any]]:
+    if pose_dir is None or not pose_dir.exists():
+        return None
+    candidate = pose_dir / visibility_path.name
+    if candidate.exists():
+        return _load_json(candidate)
+    # Some stages may use different stem but same .json.
+    candidate = pose_dir / f"{visibility_path.stem}.json"
+    return _load_json(candidate) if candidate.exists() else None
+
+
+def _collect_visibility_paths(visibility_dir: Optional[Path]) -> List[Path]:
+    if visibility_dir is None or not visibility_dir.exists():
+        return []
+    return sorted([p for p in visibility_dir.glob("*.json") if p.is_file()])
+
+
+def _fuse_chest_landmarks_from_visibility(
+    visibility_dir: Optional[Path],
+    pose_dir: Optional[Path],
+    height_cm: float,
+) -> Dict[str, Any]:
+    """
+    Fuse per-image pixel landmarks from improved visibility_analysis.py and convert to cm.
+
+    Pixel-to-cm is derived per image as:
+        cm_per_px = height_cm / person_pixel_height
+
+    If the image is cropped, this is an approximation. The output includes
+    evidence and observation counts so low-confidence or inconsistent image
+    evidence can be audited later.
+    """
+    paths = _collect_visibility_paths(visibility_dir)
+    values: Dict[str, List[float]] = {
+        "left_areola_diameter_cm": [],
+        "right_areola_diameter_cm": [],
+        "nipple_to_nipple_distance_cm": [],
+        "left_nipple_to_imf_cm": [],
+        "right_nipple_to_imf_cm": [],
+        "left_nipple_to_sternal_notch_cm": [],
+        "right_nipple_to_sternal_notch_cm": [],
+    }
+    weights: Dict[str, List[float]] = {k: [] for k in values.keys()}
+    evidence = []
+
+    def add(name: str, px_value: Optional[float], cm_per_px: float, weight: float):
+        if px_value is None or not np.isfinite(px_value):
+            return
+        values[name].append(float(px_value) * float(cm_per_px))
+        weights[name].append(max(float(weight), 1e-6))
+
+    for path in paths:
+        vis = _load_json(path)
+        if not vis:
+            continue
+        pose = _matching_pose_json(path, pose_dir)
+        person_px = _visibility_pixel_height(vis, pose)
+        if person_px is None or person_px <= 1e-6:
+            continue
+
+        cm_per_px = float(height_cm) / float(person_px)
+        chest = vis.get("chest_analysis", {})
+        if not chest or not chest.get("available", False):
+            continue
+
+        left_nip = chest.get("left_nipple", {}) or {}
+        right_nip = chest.get("right_nipple", {}) or {}
+        left_imf = chest.get("left_imf_curve", {}) or {}
+        right_imf = chest.get("right_imf_curve", {}) or {}
+        sternum = chest.get("sternum_midline", {}) or {}
+
+        chest_w = _safe_float(chest.get("chest_visibility_weight", vis.get("chest_visibility_weight", 0.0)), 0.0) or 0.0
+        left_w = _safe_float(chest.get("left_breast_visibility", vis.get("left_breast_visibility", 0.0)), 0.0) or 0.0
+        right_w = _safe_float(chest.get("right_breast_visibility", vis.get("right_breast_visibility", 0.0)), 0.0) or 0.0
+        sternum_w = _safe_float(chest.get("sternum_visibility", vis.get("sternum_visibility", 0.0)), 0.0) or 0.0
+
+        left_nip_conf = _safe_float(left_nip.get("confidence"), 0.0) or 0.0
+        right_nip_conf = _safe_float(right_nip.get("confidence"), 0.0) or 0.0
+        left_imf_conf = _safe_float(left_imf.get("confidence"), 0.0) or 0.0
+        right_imf_conf = _safe_float(right_imf.get("confidence"), 0.0) or 0.0
+        sternum_conf = _safe_float(sternum.get("confidence"), sternum_w) or sternum_w
+
+        add(
+            "left_areola_diameter_cm",
+            _safe_float(left_nip.get("areola_diameter_px")),
+            cm_per_px,
+            left_w * left_nip_conf,
+        )
+        add(
+            "right_areola_diameter_cm",
+            _safe_float(right_nip.get("areola_diameter_px")),
+            cm_per_px,
+            right_w * right_nip_conf,
+        )
+
+        if _point_visible(left_nip) and _point_visible(right_nip):
+            add(
+                "nipple_to_nipple_distance_cm",
+                _dist2d(left_nip, right_nip),
+                cm_per_px,
+                min(left_nip_conf, right_nip_conf) * chest_w,
+            )
+
+        add(
+            "left_nipple_to_imf_cm",
+            _point_to_curve_distance_px(left_nip, left_imf),
+            cm_per_px,
+            left_w * left_nip_conf * left_imf_conf,
+        )
+        add(
+            "right_nipple_to_imf_cm",
+            _point_to_curve_distance_px(right_nip, right_imf),
+            cm_per_px,
+            right_w * right_nip_conf * right_imf_conf,
+        )
+
+        add(
+            "left_nipple_to_sternal_notch_cm",
+            _point_to_sternal_notch_px(left_nip, sternum),
+            cm_per_px,
+            left_w * left_nip_conf * sternum_conf,
+        )
+        add(
+            "right_nipple_to_sternal_notch_cm",
+            _point_to_sternal_notch_px(right_nip, sternum),
+            cm_per_px,
+            right_w * right_nip_conf * sternum_conf,
+        )
+
+        evidence.append({
+            "visibility_json": str(path),
+            "image": vis.get("image"),
+            "person_pixel_height": float(person_px),
+            "cm_per_px": float(cm_per_px),
+            "chest_visibility_weight": float(chest_w),
+            "left_breast_visibility": float(left_w),
+            "right_breast_visibility": float(right_w),
+            "sternum_visibility": float(sternum_w),
+            "left_nipple": left_nip,
+            "right_nipple": right_nip,
+            "left_imf_curve": left_imf,
+            "right_imf_curve": right_imf,
+            "sternum_midline": sternum,
+        })
+
+    fused: Dict[str, Any] = {}
+    for key, vals in values.items():
+        fused[key] = _weighted_median(vals, weights[key])
+        fused[f"{key}_mean"] = _weighted_mean(vals, weights[key])
+        fused[f"{key}_num_observations"] = int(len(vals))
+
+    fused["evidence"] = evidence
+    return fused
 
 
 # ============================================================
@@ -445,18 +766,48 @@ def _ptosis_grade(nipple: np.ndarray, imf: np.ndarray) -> Tuple[int, float]:
     return grade, abs(float(imf[1] - nipple[1]))
 
 
+def _ptosis_grade_from_distance_cm(distance_cm: Optional[float]) -> Optional[int]:
+    """
+    Image-derived ptosis fallback based on nipple-to-IMF distance.
+    This is heuristic and mainly useful for relative consistency.
+    """
+    if distance_cm is None:
+        return None
+    if distance_cm < 2.0:
+        return 0
+    if distance_cm < 4.0:
+        return 1
+    if distance_cm < 7.0:
+        return 2
+    return 3
+
+
+def _prefer_image_measurement(image_value: Optional[float], mesh_value: float) -> float:
+    if image_value is None or not np.isfinite(image_value):
+        return float(mesh_value)
+    return float(image_value)
+
+
 # ============================================================
 # MAIN MEASUREMENT EXTRACTION
 # ============================================================
 
 def extract_measurements(
     npz_path: Path,
-    height_cm: float,
+    height_cm: Optional[float] = None,
     density_g_per_cm3: float = 0.95,
     flip_left_right: bool = False,
-) -> Dict[str, float]:
+    visibility_dir: Optional[Path] = None,
+    pose_dir: Optional[Path] = None,
+) -> Dict[str, Any]:
+    if height_cm is None:
+        height_cm = 165.0
+        height_was_assumed = True
+    else:
+        height_was_assumed = False
+
     raw_vertices, faces, payload = _as_vertices_faces(npz_path)
-    vertices, scale = _scale_vertices_to_cm(raw_vertices, height_cm)
+    vertices, scale = _scale_vertices_to_cm(raw_vertices, float(height_cm))
 
     y_min, y_max = vertices[:, 1].min(), vertices[:, 1].max()
     height = y_max - y_min
@@ -482,6 +833,24 @@ def extract_measurements(
     overbust = _circumference_at_y(vertices, faces, overbust_y)
     underbust = _circumference_at_y(vertices, faces, underbust_y)
 
+    # More robust waist / hip / BWH perimeters.
+    waist_circ, waist_y = _best_circumference_in_band(
+        vertices,
+        faces,
+        y_min + 0.40 * height,
+        y_min + 0.58 * height,
+        mode="min",
+        samples=48,
+    )
+    hip_circ, hip_y = _best_circumference_in_band(
+        vertices,
+        faces,
+        y_min + 0.32 * height,
+        y_min + 0.52 * height,
+        mode="max",
+        samples=48,
+    )
+
     left_base_width = _base_width(vertices, masks["left_breast"])
     right_base_width = _base_width(vertices, masks["right_breast"])
 
@@ -501,29 +870,43 @@ def extract_measurements(
     left_area = _surface_area(vertices, faces, masks["left_breast"])
     right_area = _surface_area(vertices, faces, masks["right_breast"])
 
-    left_grade, left_ptosis_dist = _ptosis_grade(left_nipple, left_imf)
-    right_grade, right_ptosis_dist = _ptosis_grade(right_nipple, right_imf)
+    left_grade_mesh, left_ptosis_dist_mesh = _ptosis_grade(left_nipple, left_imf)
+    right_grade_mesh, right_ptosis_dist_mesh = _ptosis_grade(right_nipple, right_imf)
 
-    nipple_distance = float(np.linalg.norm(left_nipple - right_nipple))
-    left_nipple_to_imf = float(np.linalg.norm(left_nipple - left_imf))
-    right_nipple_to_imf = float(np.linalg.norm(right_nipple - right_imf))
-    left_nipple_to_notch = float(np.linalg.norm(left_nipple - sternum_notch))
-    right_nipple_to_notch = float(np.linalg.norm(right_nipple - sternum_notch))
+    nipple_distance_mesh = float(np.linalg.norm(left_nipple - right_nipple))
+    left_nipple_to_imf_mesh = float(np.linalg.norm(left_nipple - left_imf))
+    right_nipple_to_imf_mesh = float(np.linalg.norm(right_nipple - right_imf))
+    left_nipple_to_notch_mesh = float(np.linalg.norm(left_nipple - sternum_notch))
+    right_nipple_to_notch_mesh = float(np.linalg.norm(right_nipple - sternum_notch))
 
     left_conicity = float(left_projection / max(1e-6, left_base_width * 0.5))
     right_conicity = float(right_projection / max(1e-6, right_base_width * 0.5))
 
-    waist_y = y_min + 0.46 * height
-    hip_y = y_min + 0.38 * height
-    waist_circ = _circumference_at_y(vertices, faces, waist_y)
-    hip_circ = _circumference_at_y(vertices, faces, hip_y)
     waist_to_hip = float(waist_circ / max(1e-6, hip_circ))
 
     crotch_y = y_min + 0.47 * height
     leg_len = crotch_y - y_min
     leg_to_body_ratio = float(leg_len / max(1e-6, height))
 
-    result = {
+    # Fuse image-derived chest landmarks and convert from px to cm.
+    chest_landmarks = _fuse_chest_landmarks_from_visibility(
+        visibility_dir=Path(visibility_dir) if visibility_dir else None,
+        pose_dir=Path(pose_dir) if pose_dir else None,
+        height_cm=float(height_cm),
+    )
+
+    left_nipple_to_imf = _prefer_image_measurement(chest_landmarks.get("left_nipple_to_imf_cm"), left_nipple_to_imf_mesh)
+    right_nipple_to_imf = _prefer_image_measurement(chest_landmarks.get("right_nipple_to_imf_cm"), right_nipple_to_imf_mesh)
+    nipple_distance = _prefer_image_measurement(chest_landmarks.get("nipple_to_nipple_distance_cm"), nipple_distance_mesh)
+    left_nipple_to_notch = _prefer_image_measurement(chest_landmarks.get("left_nipple_to_sternal_notch_cm"), left_nipple_to_notch_mesh)
+    right_nipple_to_notch = _prefer_image_measurement(chest_landmarks.get("right_nipple_to_sternal_notch_cm"), right_nipple_to_notch_mesh)
+
+    left_grade_img = _ptosis_grade_from_distance_cm(chest_landmarks.get("left_nipple_to_imf_cm"))
+    right_grade_img = _ptosis_grade_from_distance_cm(chest_landmarks.get("right_nipple_to_imf_cm"))
+    left_grade = int(left_grade_img if left_grade_img is not None else left_grade_mesh)
+    right_grade = int(right_grade_img if right_grade_img is not None else right_grade_mesh)
+
+    result: Dict[str, Any] = {
         "bust_underbust_cm": underbust,
         "bust_overbust_cm": overbust,
         "bust_left_base_width_cm": left_base_width,
@@ -532,8 +915,8 @@ def extract_measurements(
         "bust_right_projection_cm": right_projection,
         "bust_left_ptosis_grade": int(left_grade),
         "bust_right_ptosis_grade": int(right_grade),
-        "bust_left_ptosis_distance_cm": left_ptosis_dist,
-        "bust_right_ptosis_distance_cm": right_ptosis_dist,
+        "bust_left_ptosis_distance_cm": left_nipple_to_imf,
+        "bust_right_ptosis_distance_cm": right_nipple_to_imf,
         "bust_left_volume_cm3": left_volume,
         "bust_right_volume_cm3": right_volume,
         "bust_left_estimated_weight_g": left_weight,
@@ -552,16 +935,47 @@ def extract_measurements(
         "bust_right_surface_area_cm2": right_area,
         "leg_to_body_ratio": leg_to_body_ratio,
         "waist_to_hip_ratio": waist_to_hip,
+
+        # Additional measurements requested
+        "waist_cm": waist_circ,
+        "hip_cm": hip_circ,
+        "bust_waist_hip_perimeter_cm": {
+            "bust_cm": overbust,
+            "waist_cm": waist_circ,
+            "hip_cm": hip_circ,
+        },
+        "bust_waist_hip_perimeter_label": f"{overbust:.1f}-{waist_circ:.1f}-{hip_circ:.1f} cm",
+
+        # New image-derived chest landmark measurements, converted px -> cm
+        "bust_left_areola_diameter_cm": chest_landmarks.get("left_areola_diameter_cm"),
+        "bust_right_areola_diameter_cm": chest_landmarks.get("right_areola_diameter_cm"),
+        "bust_left_areola_diameter_cm_mean": chest_landmarks.get("left_areola_diameter_cm_mean"),
+        "bust_right_areola_diameter_cm_mean": chest_landmarks.get("right_areola_diameter_cm_mean"),
+        "bust_left_areola_diameter_cm_num_observations": chest_landmarks.get("left_areola_diameter_cm_num_observations", 0),
+        "bust_right_areola_diameter_cm_num_observations": chest_landmarks.get("right_areola_diameter_cm_num_observations", 0),
+
+        # Preserve fused values for audit.
+        "chest_landmark_measurements_cm": {
+            k: v for k, v in chest_landmarks.items() if k != "evidence"
+        },
+        "chest_landmark_evidence": chest_landmarks.get("evidence", []),
+
         "_metadata": {
             "source_npz": str(npz_path),
             "known_height_cm": float(height_cm),
+            "height_cm": float(height_cm),
+            "height_was_assumed": bool(height_was_assumed),
+            "default_height_cm": 165.0,
             "mesh_to_cm_scale": float(scale),
             "density_g_per_cm3": float(density_g_per_cm3),
-            "method": "geometric_estimate_from_fitted_smplx_mesh",
+            "visibility_dir": str(visibility_dir) if visibility_dir else None,
+            "pose_dir": str(pose_dir) if pose_dir else None,
+            "method": "mesh_geometry_plus_visibility_chest_landmark_fusion",
             "note": (
-                "Nipple, IMF, sternum, ptosis, breast volume and weight are estimated "
-                "from mesh geometry. For production/clinical-grade values, provide "
-                "explicit nipple/IMF/sternal-notch landmarks or a scan-grade mesh."
+                "Nipple, IMF, sternum, ptosis, breast volume and weight are estimated. "
+                "Image-derived chest landmarks are converted from pixels to cm using "
+                "height_cm / per-image visible body pixel height. If height was omitted, "
+                "165 cm is assumed."
             ),
         },
         "_landmarks_cm": {
@@ -570,6 +984,12 @@ def extract_measurements(
             "left_imf_xyz": left_imf.tolist(),
             "right_imf_xyz": right_imf.tolist(),
             "sternal_notch_xyz": sternum_notch.tolist(),
+        },
+        "_mesh_slice_levels_cm": {
+            "overbust_y_cm": overbust_y,
+            "underbust_y_cm": underbust_y,
+            "waist_y_cm": waist_y,
+            "hip_y_cm": hip_y,
         },
     }
 
@@ -589,6 +1009,15 @@ def _flip_left_right_metrics(result: Dict) -> Dict:
             if right_key in result:
                 swapped[key] = result[right_key]
                 swapped[right_key] = result[key]
+
+    # Extra left/right fields without bust_left prefix
+    for a, b in [
+        ("bust_left_areola_diameter_cm", "bust_right_areola_diameter_cm"),
+        ("bust_left_areola_diameter_cm_mean", "bust_right_areola_diameter_cm_mean"),
+        ("bust_left_areola_diameter_cm_num_observations", "bust_right_areola_diameter_cm_num_observations"),
+    ]:
+        if a in swapped and b in swapped:
+            swapped[a], swapped[b] = swapped[b], swapped[a]
 
     lm = dict(result.get("_landmarks_cm", {}))
 
@@ -622,6 +1051,11 @@ def _json_clean(value):
     if isinstance(value, (np.int32, np.int64)):
         return int(value)
 
+    if isinstance(value, float):
+        if not np.isfinite(value):
+            return None
+        return value
+
     return value
 
 
@@ -629,8 +1063,28 @@ def main():
     parser = argparse.ArgumentParser(description="Extract body/bust measurements from SMPL-X NPZ")
 
     parser.add_argument("--npz", required=True, type=str)
-    parser.add_argument("--height-cm", required=True, type=float)
+    parser.add_argument(
+        "--height-cm",
+        required=False,
+        type=float,
+        default=None,
+        help="Known real model height in cm. If omitted, 165 cm is assumed.",
+    )
     parser.add_argument("--output", required=True, type=str)
+
+    parser.add_argument(
+        "--visibility-dir",
+        type=str,
+        default=None,
+        help="Directory containing visibility JSONs with chest_analysis landmarks.",
+    )
+
+    parser.add_argument(
+        "--pose-dir",
+        type=str,
+        default=None,
+        help="Optional directory containing pose JSONs. Used as fallback for pixel height scaling.",
+    )
 
     parser.add_argument(
         "--density-g-per-cm3",
@@ -652,6 +1106,8 @@ def main():
         height_cm=args.height_cm,
         density_g_per_cm3=args.density_g_per_cm3,
         flip_left_right=args.flip_left_right,
+        visibility_dir=Path(args.visibility_dir) if args.visibility_dir else None,
+        pose_dir=Path(args.pose_dir) if args.pose_dir else None,
     )
 
     output_path = Path(args.output)
@@ -665,12 +1121,17 @@ def main():
     for key in [
         "bust_underbust_cm",
         "bust_overbust_cm",
+        "waist_cm",
+        "hip_cm",
+        "bust_waist_hip_perimeter_label",
+        "bust_left_areola_diameter_cm",
+        "bust_right_areola_diameter_cm",
         "bust_left_volume_cm3",
         "bust_right_volume_cm3",
         "waist_to_hip_ratio",
         "leg_to_body_ratio",
     ]:
-        print(f"{key}: {measurements[key]}")
+        print(f"{key}: {measurements.get(key)}")
 
 
 if __name__ == "__main__":

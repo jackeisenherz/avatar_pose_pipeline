@@ -1,5 +1,6 @@
 
 # Drop-in replacement for: src/smplx_fit/multi_image_optimizer.py
+# Patched v3: breast-only correction is neutral during main fit, then applies a constrained 3D cleavage-valley/medial-separation stage.
 
 import json
 from pathlib import Path
@@ -17,6 +18,426 @@ from .joint_mapper import SMPLXJointMapper
 from .body_regions import BodyRegionWeights
 from .region_masks import RegionAwareMasks
 from .losses import silhouette_loss, shape_prior_loss, pose_prior_loss, translation_loss
+
+
+
+def _bst_normalize(v: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    return v / (torch.linalg.norm(v, dim=-1, keepdim=True) + eps)
+
+
+class BreastSoftTissueModel(nn.Module):
+    """
+    Constrained parametric breast soft-tissue corrective layer for SMPL-X.
+
+    This is intentionally not a free vertex-offset model.  It exposes a small
+    set of anatomical controls and converts them into a bounded displacement
+    field using the generated SMPL-X breast topology prior:
+
+      projection       -> outward movement of breast lobe vertices
+      lower fullness   -> outward + downward movement of lower-pole vertices
+      sag              -> downward movement, strongest in lower breast
+      lateral spread   -> small side-specific outward spread
+      IMF fold         -> very small inward tether on the IMF band
+
+    Hard guard masks zero displacement on sternum, armpits, upper chest and
+    abdomen.  A per-vertex deformation budget prevents visible mesh mutations.
+    """
+
+    def __init__(
+        self,
+        prior_json,
+        weights_npz,
+        device=None,
+        dtype=torch.float32,
+        max_projection_m=0.045,
+        max_sag_m=0.042,
+        max_lateral_spread_m=0.020,
+        max_fold_depth_m=0.010,
+        max_lower_fullness_m=0.032,
+        max_medial_separation_m=0.032,
+        max_cleavage_valley_m=0.026,
+    ):
+        super().__init__()
+        self.prior_json = Path(prior_json)
+        self.weights_npz = Path(weights_npz)
+        self.prior = json.loads(self.prior_json.read_text())
+        self.vertex_count = int(self.prior["vertex_count"])
+        coord = self.prior.get("coordinate_convention", {}) or {}
+        self.depth_axis = int(coord.get("template_depth_axis", 2))
+        self.front_sign = float(coord.get("template_front_sign", 1.0))
+        self.anchors = self.prior.get("anchors", {}) or {}
+
+        w = np.load(str(self.weights_npz))
+
+        def _load_weight(canonical_key, aliases=(), required=True):
+            candidates = [canonical_key] + list(aliases or [])
+            for k in candidates:
+                if k in w:
+                    arr = torch.as_tensor(np.asarray(w[k]), dtype=dtype, device=device)
+                    if arr.numel() != self.vertex_count:
+                        raise ValueError(f"{k} has {arr.numel()} weights, expected {self.vertex_count}")
+                    return arr.reshape(1, -1, 1).clamp(0.0, 1.0)
+            if required:
+                available = sorted(list(w.files))
+                raise KeyError(f"weights file missing {canonical_key}. Tried {candidates}. Available keys={available}")
+            return torch.zeros(1, self.vertex_count, 1, dtype=dtype, device=device)
+
+        aliases = {
+            "left_breast": ("plus_x_breast",),
+            "right_breast": ("minus_x_breast",),
+            "left_imf": ("left_imf_band", "plus_x_imf_band", "left_imf_weight", "left_imf_weights"),
+            "right_imf": ("right_imf_band", "minus_x_imf_band", "right_imf_weight", "right_imf_weights"),
+            "left_lower_pole": ("plus_x_lower_pole",),
+            "right_lower_pole": ("minus_x_lower_pole",),
+            "left_upper_pole": ("plus_x_upper_pole",),
+            "right_upper_pole": ("minus_x_upper_pole",),
+            "sternum": ("sternum_guard",),
+            "left_armpit_guard": ("plus_x_armpit_guard",),
+            "right_armpit_guard": ("minus_x_armpit_guard",),
+            "upper_chest_guard": ("upper_chest",),
+            "abdomen_guard": ("abdomen",),
+        }
+        required = [
+            "left_breast", "right_breast", "left_imf", "right_imf",
+            "left_lower_pole", "right_lower_pole", "sternum",
+            "left_armpit_guard", "right_armpit_guard", "upper_chest_guard", "abdomen_guard",
+        ]
+        optional = ["left_upper_pole", "right_upper_pole"]
+        for key in required:
+            self.register_buffer(f"w_{key}", _load_weight(key, aliases.get(key, ()), required=True), persistent=False)
+        for key in optional:
+            self.register_buffer(f"w_{key}", _load_weight(key, aliases.get(key, ()), required=False), persistent=False)
+
+        self.weight_file_keys = sorted(list(w.files))
+        self.max_projection_m = float(max_projection_m)
+        self.max_sag_m = float(max_sag_m)
+        self.max_lateral_spread_m = float(max_lateral_spread_m)
+        self.max_fold_depth_m = float(max_fold_depth_m)
+        self.max_lower_fullness_m = float(max_lower_fullness_m)
+        self.max_medial_separation_m = float(max_medial_separation_m)
+        self.max_cleavage_valley_m = float(max_cleavage_valley_m)
+
+        # Raw controls start near -8 so the actual displacement is effectively
+        # zero until the dedicated breast pass intentionally activates them.
+        # Previous versions initialized at raw=0, which produced a nonzero
+        # deformation even while the layer was supposedly disabled.
+        z = torch.full((), -8.0, dtype=dtype, device=device)
+        self.left_projection_raw = nn.Parameter(z.clone())
+        self.right_projection_raw = nn.Parameter(z.clone())
+        self.left_sag_raw = nn.Parameter(z.clone())
+        self.right_sag_raw = nn.Parameter(z.clone())
+        self.left_lateral_spread_raw = nn.Parameter(z.clone())
+        self.right_lateral_spread_raw = nn.Parameter(z.clone())
+        self.left_fold_depth_raw = nn.Parameter(z.clone())
+        self.right_fold_depth_raw = nn.Parameter(z.clone())
+        self.left_lower_fullness_raw = nn.Parameter(z.clone())
+        self.right_lower_fullness_raw = nn.Parameter(z.clone())
+        self.left_medial_separation_raw = nn.Parameter(z.clone())
+        self.right_medial_separation_raw = nn.Parameter(z.clone())
+        self.cleavage_valley_raw = nn.Parameter(z.clone())
+
+        self._build_effective_masks()
+
+    def _positive_control(self, raw, max_value):
+        # Non-negative anatomical controls.  Negative projection/sag/fold is not
+        # physically useful here and caused chest implosions in previous runs.
+        return max_value * torch.sigmoid(raw)
+
+    def _control_values(self):
+        return {
+            "left_projection_m": self._positive_control(self.left_projection_raw, self.max_projection_m),
+            "right_projection_m": self._positive_control(self.right_projection_raw, self.max_projection_m),
+            "left_sag_m": self._positive_control(self.left_sag_raw, self.max_sag_m),
+            "right_sag_m": self._positive_control(self.right_sag_raw, self.max_sag_m),
+            "left_lateral_spread_m": self._positive_control(self.left_lateral_spread_raw, self.max_lateral_spread_m),
+            "right_lateral_spread_m": self._positive_control(self.right_lateral_spread_raw, self.max_lateral_spread_m),
+            "left_fold_depth_m": self._positive_control(self.left_fold_depth_raw, self.max_fold_depth_m),
+            "right_fold_depth_m": self._positive_control(self.right_fold_depth_raw, self.max_fold_depth_m),
+            "left_lower_fullness_m": self._positive_control(self.left_lower_fullness_raw, self.max_lower_fullness_m),
+            "right_lower_fullness_m": self._positive_control(self.right_lower_fullness_raw, self.max_lower_fullness_m),
+            "left_medial_separation_m": self._positive_control(self.left_medial_separation_raw, self.max_medial_separation_m),
+            "right_medial_separation_m": self._positive_control(self.right_medial_separation_raw, self.max_medial_separation_m),
+            "cleavage_valley_m": self._positive_control(self.cleavage_valley_raw, self.max_cleavage_valley_m),
+        }
+
+    def parameters_as_dict(self):
+        with torch.no_grad():
+            return {k: float(v.detach().cpu()) for k, v in self._control_values().items()}
+
+    def set_controls_from_targets(self, targets):
+        """Set physical controls in meters via inverse sigmoid.
+
+        This is used at the start of the breast-only pass so the phase starts
+        from a small anatomical correction instead of spending hundreds of
+        steps escaping a near-zero sigmoid plateau.
+        """
+        name_to_param = {
+            "left_projection_m": (self.left_projection_raw, self.max_projection_m),
+            "right_projection_m": (self.right_projection_raw, self.max_projection_m),
+            "left_sag_m": (self.left_sag_raw, self.max_sag_m),
+            "right_sag_m": (self.right_sag_raw, self.max_sag_m),
+            "left_lateral_spread_m": (self.left_lateral_spread_raw, self.max_lateral_spread_m),
+            "right_lateral_spread_m": (self.right_lateral_spread_raw, self.max_lateral_spread_m),
+            "left_fold_depth_m": (self.left_fold_depth_raw, self.max_fold_depth_m),
+            "right_fold_depth_m": (self.right_fold_depth_raw, self.max_fold_depth_m),
+            "left_lower_fullness_m": (self.left_lower_fullness_raw, self.max_lower_fullness_m),
+            "right_lower_fullness_m": (self.right_lower_fullness_raw, self.max_lower_fullness_m),
+            "left_medial_separation_m": (self.left_medial_separation_raw, self.max_medial_separation_m),
+            "right_medial_separation_m": (self.right_medial_separation_raw, self.max_medial_separation_m),
+            "cleavage_valley_m": (self.cleavage_valley_raw, self.max_cleavage_valley_m),
+        }
+        with torch.no_grad():
+            for k, val in (targets or {}).items():
+                if k not in name_to_param:
+                    continue
+                param, scale = name_to_param[k]
+                y = float(val) / max(float(scale), 1e-8)
+                y = min(max(y, 1e-4), 1.0 - 1e-4)
+                raw = torch.logit(torch.tensor(y, dtype=param.dtype, device=param.device))
+                param.copy_(raw)
+
+    def neutralize(self):
+        """Return controls to near-zero deformation."""
+        with torch.no_grad():
+            for p in self.parameters():
+                p.fill_(-9.0)
+
+    def max_deformation_m(self, base_vertices, corrected_vertices):
+        return torch.linalg.norm(corrected_vertices - base_vertices, dim=-1).amax()
+
+    def _build_effective_masks(self):
+        # Hard guards.  This is applied to the masks before any optimization, so
+        # even high losses cannot move guarded vertices.
+        hard_guard = (
+            1.25 * self.w_sternum
+            + 1.15 * self.w_upper_chest_guard
+            + 1.15 * self.w_abdomen_guard
+            + 0.95 * self.w_left_armpit_guard
+            + 0.95 * self.w_right_armpit_guard
+        ).clamp(0.0, 1.0)
+        self.register_buffer("w_hard_guard", hard_guard, persistent=False)
+        safe = (1.0 - hard_guard).clamp(0.0, 1.0)
+        # Squaring the safe factor makes transitions fade smoothly near guards.
+        safe2 = safe * safe
+        self.register_buffer("w_left_breast_eff", (self.w_left_breast * safe2).clamp(0.0, 1.0), persistent=False)
+        self.register_buffer("w_right_breast_eff", (self.w_right_breast * safe2).clamp(0.0, 1.0), persistent=False)
+        self.register_buffer("w_left_lower_eff", (self.w_left_lower_pole * safe2).clamp(0.0, 1.0), persistent=False)
+        self.register_buffer("w_right_lower_eff", (self.w_right_lower_pole * safe2).clamp(0.0, 1.0), persistent=False)
+        self.register_buffer("w_left_upper_eff", (self.w_left_upper_pole * safe2).clamp(0.0, 1.0), persistent=False)
+        self.register_buffer("w_right_upper_eff", (self.w_right_upper_pole * safe2).clamp(0.0, 1.0), persistent=False)
+        self.register_buffer("w_left_imf_eff", (self.w_left_imf * safe2).clamp(0.0, 1.0), persistent=False)
+        self.register_buffer("w_right_imf_eff", (self.w_right_imf * safe2).clamp(0.0, 1.0), persistent=False)
+        breast_any = (self.w_left_breast_eff + self.w_right_breast_eff + self.w_left_lower_eff + self.w_right_lower_eff).clamp(0.0, 1.0)
+        self.register_buffer("w_breast_any_eff", breast_any, persistent=False)
+
+        # A narrow sternum/inter-breast valley is the only guarded-area motion
+        # allowed.  It is an inward tether, not a free sternum deformation.
+        # It counteracts the characteristic tenting bridge between breast lobes.
+        valley_safe = (1.0 - 0.90*self.w_upper_chest_guard - 0.90*self.w_abdomen_guard - 0.60*self.w_left_armpit_guard - 0.60*self.w_right_armpit_guard).clamp(0.0, 1.0)
+        self.register_buffer("w_cleavage_valley_eff", (self.w_sternum * valley_safe).clamp(0.0, 1.0), persistent=False)
+
+        # Per-region displacement budget in meters. Lower pole gets most freedom;
+        # IMF is a shallow crease only; upper pole stays subtle.
+        budget = (
+            0.006 * (self.w_left_upper_eff + self.w_right_upper_eff)
+            + 0.024 * (self.w_left_breast_eff + self.w_right_breast_eff)
+            + 0.038 * (self.w_left_lower_eff + self.w_right_lower_eff)
+            + 0.010 * (self.w_left_imf_eff + self.w_right_imf_eff)
+        ).clamp(0.0, 0.045)
+        self.register_buffer("w_disp_budget", budget, persistent=False)
+
+    def _compute_frame(self, vertices, joints=None):
+        B = vertices.shape[0]
+        dev = vertices.device
+        dtype = vertices.dtype
+        if joints is not None and joints.ndim == 3 and joints.shape[1] > 17:
+            left_hip = joints[:, 1]
+            right_hip = joints[:, 2]
+            left_shoulder = joints[:, 16]
+            right_shoulder = joints[:, 17]
+            origin = 0.5 * (left_shoulder + right_shoulder)
+            right_axis = _bst_normalize(left_shoulder - right_shoulder)
+            up_axis = _bst_normalize(0.5 * (left_shoulder + right_shoulder) - 0.5 * (left_hip + right_hip))
+            front_axis = _bst_normalize(torch.cross(right_axis, up_axis, dim=-1))
+            up_axis = _bst_normalize(torch.cross(front_axis, right_axis, dim=-1))
+        else:
+            origin = vertices.mean(dim=1)
+            right_axis = torch.tensor([1.0, 0.0, 0.0], device=dev, dtype=dtype).reshape(1, 3).expand(B, 3)
+            up_axis = torch.tensor([0.0, 1.0, 0.0], device=dev, dtype=dtype).reshape(1, 3).expand(B, 3)
+            fv = [0.0, 0.0, 0.0]
+            fv[self.depth_axis] = self.front_sign
+            front_axis = torch.tensor(fv, device=dev, dtype=dtype).reshape(1, 3).expand(B, 3)
+        return origin, right_axis, up_axis, front_axis
+
+    def _correct_front_direction(self, vertices, front):
+        # Ensure front points from sternum toward breast lobes.  If the cross
+        # product frame is flipped, outward projection becomes inward indentation.
+        breast_w = self.w_breast_any_eff.clamp(0.0, 1.0)
+        sternum_w = self.w_sternum.clamp(0.0, 1.0)
+        bw_sum = breast_w.sum(dim=1).clamp_min(1e-6)
+        sw_sum = sternum_w.sum(dim=1).clamp_min(1e-6)
+        breast_center = (vertices * breast_w).sum(dim=1) / bw_sum
+        sternum_center = (vertices * sternum_w).sum(dim=1) / sw_sum
+        sign = torch.sign(((breast_center - sternum_center) * front).sum(dim=-1, keepdim=True))
+        sign = torch.where(sign < 0.0, -torch.ones_like(sign), torch.ones_like(sign))
+        return front * sign
+
+    def forward(self, vertices, joints=None, gravity_world=None, stage="full"):
+        if vertices.ndim != 3 or vertices.shape[1] != self.vertex_count or vertices.shape[2] != 3:
+            raise ValueError(f"vertices must be [B,{self.vertex_count},3], got {tuple(vertices.shape)}")
+        B = vertices.shape[0]
+        # Keep the local body-frame origin returned by _compute_frame.
+        # The medial-separation/cleavage band uses this origin below when
+        # computing local x coordinates. A previous patch discarded it with
+        # `_`, then later referenced `origin`, causing NameError at the start
+        # of breast-only refinement.
+        origin, right, up, front = self._compute_frame(vertices, joints)
+        front = self._correct_front_direction(vertices, front)
+        if gravity_world is None:
+            gravity = -up
+        else:
+            gravity = gravity_world.to(device=vertices.device, dtype=vertices.dtype)
+            if gravity.ndim == 1:
+                gravity = gravity.reshape(1, 3).expand(B, 3)
+            gravity = _bst_normalize(gravity)
+
+        vals = self._control_values()
+        lp = vals["left_projection_m"]; rp = vals["right_projection_m"]
+        ls = vals["left_sag_m"]; rs = vals["right_sag_m"]
+        ll = vals["left_lateral_spread_m"]; rl = vals["right_lateral_spread_m"]
+        lf = vals["left_fold_depth_m"]; rf = vals["right_fold_depth_m"]
+        llower = vals["left_lower_fullness_m"]; rlower = vals["right_lower_fullness_m"]
+        lsep = vals["left_medial_separation_m"]; rsep = vals["right_medial_separation_m"]
+        cvalley = vals["cleavage_valley_m"]
+
+        # Internal breast-phase staging. The optimizer can run many iterations,
+        # but each stage has a safe subset of anatomical controls.
+        if stage == "projection":
+            ls = rs = ll = rl = lf = rf = llower = rlower = lsep = rsep = cvalley = torch.zeros_like(lp)
+        elif stage == "volume":
+            lf = rf = cvalley = torch.zeros_like(lp)
+        elif stage == "fold":
+            # Fold stage enables the inter-breast valley and medial separation.
+            pass
+
+        front_b = front.reshape(B, 1, 3)
+        right_b = right.reshape(B, 1, 3)
+        gravity_b = gravity.reshape(B, 1, 3)
+        disp = torch.zeros_like(vertices)
+        # Projection and lower-pole fullness.
+        disp = disp + self.w_left_breast_eff * lp * front_b
+        disp = disp + self.w_right_breast_eff * rp * front_b
+        disp = disp + self.w_left_lower_eff * llower * (0.78 * front_b + 0.22 * gravity_b)
+        disp = disp + self.w_right_lower_eff * rlower * (0.78 * front_b + 0.22 * gravity_b)
+        # Sag is strongest in breast/lower masks but zeroed by guard masks.
+        disp = disp + (0.35 * self.w_left_breast_eff + 0.65 * self.w_left_lower_eff) * ls * gravity_b
+        disp = disp + (0.35 * self.w_right_breast_eff + 0.65 * self.w_right_lower_eff) * rs * gravity_b
+        # Lateral spread of the whole lobe.
+        disp = disp + self.w_left_breast_eff * ll * right_b
+        disp = disp - self.w_right_breast_eff * rl * right_b
+
+        # Medial separation acts only on the inner breast edges near the sternum.
+        # Use the local body-frame x coordinate, not the world X coordinate, so
+        # this works for all poses/orientations. The band is intentionally broad
+        # enough to catch the vertices that form the visible tent bridge.
+        local = vertices - origin.reshape(B, 1, 3)
+        x = (local * right_b).sum(dim=-1, keepdim=True)
+        sden = self.w_cleavage_valley_eff.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        stern_x = (x * self.w_cleavage_valley_eff).sum(dim=1, keepdim=True) / sden
+        x_span = (x.max(dim=1, keepdim=True).values - x.min(dim=1, keepdim=True).values).clamp_min(1e-6)
+        sigma = (0.085 * x_span).clamp_min(1e-5)
+        near_sternum = torch.exp(-((x - stern_x) / sigma).square()).clamp(0.0, 1.0)
+        left_medial = (self.w_left_breast_eff * near_sternum).clamp(0.0, 1.0)
+        right_medial = (self.w_right_breast_eff * near_sternum).clamp(0.0, 1.0)
+        medial_any = (left_medial + right_medial).clamp(0.0, 1.0)
+
+        # Lobe separation moves the medial breast edges outward from the midline.
+        # It is the main control that turns a single tent into two lobes.
+        disp = disp + left_medial * lsep * right_b
+        disp = disp - right_medial * rsep * right_b
+
+        # IMF = inward tether/crease, not downward pull. This is deliberately
+        # shallow and budget-limited.
+        disp = disp - self.w_left_imf_eff * (0.55 * lf) * front_b
+        disp = disp - self.w_right_imf_eff * (0.55 * rf) * front_b
+
+        # Hard mask and per-vertex budget for breast-lobe deformation.
+        breast_disp = disp * (1.0 - self.w_hard_guard)
+        mag = torch.linalg.norm(breast_disp, dim=-1, keepdim=True).clamp_min(1e-8)
+        budget = self.w_disp_budget.to(device=vertices.device, dtype=vertices.dtype)
+        breast_disp = breast_disp * torch.clamp(budget / mag, max=1.0)
+
+        # Dedicated inter-breast valley: a narrow central strip and the medial
+        # breast edge vertices are pulled slightly inward/back. This is the one
+        # controlled deformation that directly attacks the visible tent bridge.
+        cleavage_band = (self.w_cleavage_valley_eff + 0.65 * medial_any).clamp(0.0, 1.0)
+        valley_disp = -cleavage_band * cvalley * front_b
+        valley_mag = torch.linalg.norm(valley_disp, dim=-1, keepdim=True).clamp_min(1e-8)
+        valley_budget = (0.022 * cleavage_band).clamp(0.0, 0.022)
+        valley_disp = valley_disp * torch.clamp(valley_budget / valley_mag, max=1.0)
+        return vertices + breast_disp + valley_disp
+
+    def regularization_loss(self):
+        # Penalize controls in physical units, not raw parameter space.  This
+        # keeps the optimizer from hiding large raw values behind sigmoid.
+        vals = self._control_values()
+        scales = {
+            "left_projection_m": self.max_projection_m,
+            "right_projection_m": self.max_projection_m,
+            "left_sag_m": self.max_sag_m,
+            "right_sag_m": self.max_sag_m,
+            "left_lateral_spread_m": self.max_lateral_spread_m,
+            "right_lateral_spread_m": self.max_lateral_spread_m,
+            "left_fold_depth_m": self.max_fold_depth_m,
+            "right_fold_depth_m": self.max_fold_depth_m,
+            "left_lower_fullness_m": self.max_lower_fullness_m,
+            "right_lower_fullness_m": self.max_lower_fullness_m,
+            "left_medial_separation_m": self.max_medial_separation_m,
+            "right_medial_separation_m": self.max_medial_separation_m,
+            "cleavage_valley_m": self.max_cleavage_valley_m,
+        }
+        # Do not regularize toward zero. A zero-deformation optimum makes the
+        # dedicated breast phase visually inert. Regularize toward a small,
+        # anatomically plausible correction and let image evidence adjust it.
+        targets = {
+            # The breast-only pass regularizes toward a visible but modest
+            # anatomical correction. These are NOT applied during the main body
+            # fit; the main fit stays vanilla SMPL-X plus chest offsets.
+            "left_projection_m": 0.012, "right_projection_m": 0.012,
+            "left_sag_m": 0.008, "right_sag_m": 0.008,
+            "left_lateral_spread_m": 0.002, "right_lateral_spread_m": 0.002,
+            "left_fold_depth_m": 0.004, "right_fold_depth_m": 0.004,
+            "left_lower_fullness_m": 0.008, "right_lower_fullness_m": 0.008,
+            "left_medial_separation_m": 0.014, "right_medial_separation_m": 0.014,
+            "cleavage_valley_m": 0.016,
+        }
+        loss = torch.tensor(0.0, device=next(self.parameters()).device)
+        for k, v in vals.items():
+            target=torch.tensor(targets.get(k,0.0), dtype=v.dtype, device=v.device)
+            loss = loss + ((v - target) / max(scales[k], 1e-6)).square()
+        # Mild left/right balance prevents one side from exploding to satisfy a
+        # single bad view while still allowing asymmetry.
+        loss = loss + 0.05 * (vals["left_projection_m"] - vals["right_projection_m"]).square() / (self.max_projection_m ** 2)
+        loss = loss + 0.05 * (vals["left_sag_m"] - vals["right_sag_m"]).square() / (self.max_sag_m ** 2)
+        loss = loss + 0.05 * (vals["left_medial_separation_m"] - vals["right_medial_separation_m"]).square() / (self.max_medial_separation_m ** 2)
+        return loss
+
+    def guard_deformation_loss(self, base_vertices, corrected_vertices):
+        d = torch.linalg.norm(corrected_vertices - base_vertices, dim=-1, keepdim=True)
+        guard = (
+            1.50 * self.w_sternum
+            + 1.25 * self.w_left_armpit_guard
+            + 1.25 * self.w_right_armpit_guard
+            + 1.15 * self.w_upper_chest_guard
+            + 1.15 * self.w_abdomen_guard
+            + 0.30 * (1.0 - self.w_breast_any_eff)
+        ).clamp(0.0, 1.0)
+        return (guard * d.square()).sum() / guard.sum().clamp_min(1.0)
+
+    def deformation_loss(self, base_vertices, corrected_vertices):
+        d = torch.linalg.norm(corrected_vertices - base_vertices, dim=-1, keepdim=True)
+        breast = self.w_breast_any_eff.clamp(0.0, 1.0)
+        return (breast * d.square()).sum() / breast.sum().clamp_min(1.0)
 
 
 class MultiImageOptimizer:
@@ -100,12 +521,54 @@ class MultiImageOptimizer:
         anchor_iou_tolerance=0.008,
         chest_residual_weight=3.0,
         chest_outside_guard_weight=6.0,
+        chest_landmark_weight=1.20,
+        nipple_landmark_weight=1.00,
+        imf_landmark_weight=0.80,
+        areola_landmark_weight=0.35,
+        sternum_landmark_weight=1.20,
+        cleavage_landmark_weight=1.20,
         anchor_reproj_threshold=15.0,
         anchor_sil_threshold=0.42,
         anchor_outside_threshold=0.022,
         delay_refinement_until_anchor=True,
         per_image_focal_regularization_weight=0.10,
         normalize_lower_body_loss=True,
+        use_breast_soft_tissue=True,
+        breast_prior_json=None,
+        breast_weights_npz=None,
+        breast_soft_regularization_weight=8.00,
+        breast_soft_guard_weight=35.00,
+        breast_soft_landmark_weight=0.00,
+        breast_soft_nipple_weight=1.00,
+        breast_soft_imf_weight=0.50,
+        breast_soft_areola_weight=0.25,
+        breast_soft_train_start_fraction=0.86,
+        # Frozen-body breast-only micro refinement. This runs after the normal
+        # multi-image solve and updates only the bounded BreastSoftTissueModel
+        # parameters. Camera, pose, betas, translations and chest offsets remain
+        # fixed so the breast layer cannot mutate the torso.
+        breast_only_refine=True,
+        breast_only_refine_iterations=250,
+        breast_only_refine_lr=0.0008,
+        breast_only_landmark_weight=1.20,
+        breast_only_chest_mask_weight=0.35,
+        breast_only_outside_weight=8.00,
+        breast_only_silhouette_weight=0.10,
+        breast_only_regularization_weight=120.0,
+        breast_only_guard_weight=500.0,
+        breast_only_confidence_floor=0.35,
+        # Visibility-gated breast-only refinement.  These thresholds decide which
+        # images are allowed to drive breast/sternum/cleavage terms.  Safety
+        # terms still render all images.
+        breast_only_use_visibility_gating=True,
+        breast_only_frontal_only_cleavage=True,
+        breast_only_min_side_score=0.45,
+        breast_only_min_both_side_score=0.45,
+        breast_only_min_nipple_or_areola_conf=0.55,
+        breast_only_min_bust_conf=0.55,
+        breast_only_min_imf_conf=0.60,
+        breast_only_min_sternum_conf=0.50,
+        breast_only_lateral_chest_weight=0.35,
     ):
         self.device="cuda" if torch.cuda.is_available() else "cpu"
         self.image_size=int(image_size)
@@ -175,12 +638,50 @@ class MultiImageOptimizer:
         self.anchor_iou_tolerance=float(anchor_iou_tolerance)
         self.chest_residual_weight=float(chest_residual_weight)
         self.chest_outside_guard_weight=float(chest_outside_guard_weight)
+        self.chest_landmark_weight=float(chest_landmark_weight)
+        self.nipple_landmark_weight=float(nipple_landmark_weight)
+        self.imf_landmark_weight=float(imf_landmark_weight)
+        self.areola_landmark_weight=float(areola_landmark_weight)
+        self.sternum_landmark_weight=float(sternum_landmark_weight)
+        self.cleavage_landmark_weight=float(cleavage_landmark_weight)
         self.anchor_reproj_threshold=float(anchor_reproj_threshold)
         self.anchor_sil_threshold=float(anchor_sil_threshold)
         self.anchor_outside_threshold=float(anchor_outside_threshold)
         self.delay_refinement_until_anchor=bool(delay_refinement_until_anchor)
         self.per_image_focal_regularization_weight=float(per_image_focal_regularization_weight)
         self.normalize_lower_body_loss=bool(normalize_lower_body_loss)
+
+        self.use_breast_soft_tissue=bool(use_breast_soft_tissue)
+        self.breast_prior_json=None if breast_prior_json is None else Path(breast_prior_json)
+        self.breast_weights_npz=None if breast_weights_npz is None else Path(breast_weights_npz)
+        self.breast_soft_regularization_weight=float(breast_soft_regularization_weight)
+        self.breast_soft_guard_weight=float(breast_soft_guard_weight)
+        self.breast_soft_landmark_weight=float(breast_soft_landmark_weight)
+        self.breast_soft_nipple_weight=float(breast_soft_nipple_weight)
+        self.breast_soft_imf_weight=float(breast_soft_imf_weight)
+        self.breast_soft_areola_weight=float(breast_soft_areola_weight)
+        self.breast_soft_train_start_fraction=float(breast_soft_train_start_fraction)
+        self.breast_only_refine=bool(breast_only_refine)
+        self.breast_only_refine_iterations=int(breast_only_refine_iterations)
+        self.breast_only_refine_lr=float(breast_only_refine_lr)
+        self.breast_only_landmark_weight=float(breast_only_landmark_weight)
+        self.breast_only_chest_mask_weight=float(breast_only_chest_mask_weight)
+        self.breast_only_outside_weight=float(breast_only_outside_weight)
+        self.breast_only_silhouette_weight=float(breast_only_silhouette_weight)
+        self.breast_only_regularization_weight=float(breast_only_regularization_weight)
+        self.breast_only_guard_weight=float(breast_only_guard_weight)
+        self.breast_only_confidence_floor=float(breast_only_confidence_floor)
+        self.breast_only_use_visibility_gating=bool(breast_only_use_visibility_gating)
+        self.breast_only_frontal_only_cleavage=bool(breast_only_frontal_only_cleavage)
+        self.breast_only_min_side_score=float(breast_only_min_side_score)
+        self.breast_only_min_both_side_score=float(breast_only_min_both_side_score)
+        self.breast_only_min_nipple_or_areola_conf=float(breast_only_min_nipple_or_areola_conf)
+        self.breast_only_min_bust_conf=float(breast_only_min_bust_conf)
+        self.breast_only_min_imf_conf=float(breast_only_min_imf_conf)
+        self.breast_only_min_sternum_conf=float(breast_only_min_sternum_conf)
+        self.breast_only_lateral_chest_weight=float(breast_only_lateral_chest_weight)
+        self.breast_soft=None
+        self._breast_only_refine_summary={}
 
         self.model=smplx.create(
             model_path=model_path,
@@ -190,6 +691,9 @@ class MultiImageOptimizer:
             num_betas=10,
             ext="npz",
         ).to(self.device)
+
+        if self.use_breast_soft_tissue:
+            self._init_breast_soft_tissue_layer(model_path)
 
         self.renderer=SilhouetteRenderer(image_size=image_size, device=self.device)
         self.region_maps=RegionAwareMasks.screen_region_maps(self.image_size, self.image_size, self.device)
@@ -447,7 +951,7 @@ class MultiImageOptimizer:
         quality=pose_data.get("pose_quality_score", None)
 
         if quality is None:
-            # Fallback for old YOLO-only JSONs.
+            # Conservative support for YOLO-only JSON masks.
             try:
                 confs=[float(k.get("confidence", 0.0)) for k in pose_data.get("keypoints", [])]
                 quality=float(np.mean(confs)) if len(confs)>0 else 1.0
@@ -642,7 +1146,7 @@ class MultiImageOptimizer:
                         .unsqueeze(0).unsqueeze(0)
                     )
 
-            # Fallback: if a hair_remove mask exists but no explicit validity
+            # If a hair_remove mask exists but no explicit validity
             # file exists, treat those hair pixels as unknown.
             hair_remove_path=self._find_background_debug_mask(ip, "hair_remove")
             if hair_remove_path is not None:
@@ -720,7 +1224,7 @@ class MultiImageOptimizer:
         center_x=torch.stack(xs,dim=0).mean(dim=0).view(B,1,1,1) if len(xs)>0 else torch.full((B,1,1,1), float(W)/2.0, device=mask_tensor.device)
         grid_x=torch.arange(W, device=mask_tensor.device, dtype=torch.float32).view(1,1,1,W)
         left_half=(grid_x<center_x).float(); right_half=1.0-left_half
-        breast_band=self.region_maps["breast"]
+        breast_band=self.region_maps.get("breast_fit", self.region_maps["breast"])
         left_mask=mask_tensor*breast_band*left_half
         right_mask=mask_tensor*breast_band*right_half
         if target_mask is not None:
@@ -906,6 +1410,376 @@ class MultiImageOptimizer:
             arm_np=arm_prior[0,0].detach().float().cpu().numpy()
             cv2.imwrite(str(prefix)+"_arm_prior.png", np.clip(arm_np*255.0,0,255).astype(np.uint8))
 
+
+    def _scale_chest_analysis_landmarks(self, metadata, image_path):
+        """
+        Scale the current automatic visibility-analysis JSON into optimizer coordinates.
+
+        Strict v6 behavior:
+          - only the new custom-YOLO visibility schema is accepted;
+          - legacy `chest_analysis` compatibility is intentionally removed;
+          - top-level `breast_fit_gates` are preserved and are the only authority
+            for breast-only image-use gating;
+          - if gates are absent, the breast-only pass treats the image as unusable
+            for breast anatomical losses instead of falling back to heuristics.
+        """
+        md = dict(metadata or {})
+
+        try:
+            h, w = self._load_image_shape(image_path)
+            sx = float(self.image_size) / max(float(w), 1.0)
+            sy = float(self.image_size) / max(float(h), 1.0)
+        except Exception:
+            sx = sy = 1.0
+        sxy = 0.5 * (sx + sy)
+
+        def _clip01(x, default=0.0):
+            try:
+                return float(np.clip(float(x), 0.0, 1.0))
+            except Exception:
+                return float(default)
+
+        def _is_point_like(p):
+            if p is None:
+                return False
+            if isinstance(p, (list, tuple)) and len(p) >= 2:
+                return p[0] is not None and p[1] is not None
+            if isinstance(p, dict):
+                return p.get("x") is not None and p.get("y") is not None
+            return False
+
+        def _point_xy(p):
+            if isinstance(p, dict):
+                return float(p["x"]), float(p["y"])
+            return float(p[0]), float(p[1])
+
+        def scale_point(p, confidence=1.0, visible=True, extra=None):
+            conf = _clip01(confidence, 0.0)
+            if (not visible) or (not _is_point_like(p)) or conf <= 0.0:
+                ret = {"visible": False, "confidence": conf, "x": None, "y": None}
+                if extra:
+                    ret.update(extra)
+                return ret
+            x, y = _point_xy(p)
+            ret = {"visible": True, "confidence": conf, "x": x * sx, "y": y * sy}
+            if extra:
+                ret.update(extra)
+            if ret.get("areola_diameter_px") is not None:
+                try:
+                    ret["areola_diameter_px"] = float(ret["areola_diameter_px"]) * sxy
+                except Exception:
+                    ret["areola_diameter_px"] = None
+            if ret.get("radius_px") is not None:
+                try:
+                    ret["radius_px"] = float(ret["radius_px"]) * sxy
+                except Exception:
+                    ret["radius_px"] = None
+            return ret
+
+        def scale_curve(curve, confidence=1.0, visible=True):
+            conf = _clip01(confidence, 0.0)
+            if isinstance(curve, dict):
+                pts = curve.get("points", []) or curve.get("line", []) or []
+                conf = _clip01(curve.get("confidence", conf), conf)
+                visible = bool(curve.get("visible", visible))
+            else:
+                pts = curve or []
+            out = []
+            for pnt in pts:
+                if _is_point_like(pnt):
+                    x, y = _point_xy(pnt)
+                    out.append([x * sx, y * sy])
+            return {"visible": bool(visible) and len(out) >= 2 and conf > 0.0, "confidence": conf, "points": out}
+
+        def scale_bbox(bbox, confidence=1.0, visible=True):
+            conf = _clip01(confidence, 0.0)
+            if bbox is None or len(bbox) < 4 or (not visible) or conf <= 0.0:
+                return {"visible": False, "confidence": conf, "bbox": None}
+            x1, y1, x2, y2 = [float(v) for v in bbox[:4]]
+            x1, x2 = sorted([x1 * sx, x2 * sx])
+            y1, y2 = sorted([y1 * sy, y2 * sy])
+            return {
+                "visible": True,
+                "confidence": conf,
+                "bbox": [x1, y1, x2, y2],
+                "cx": 0.5 * (x1 + x2),
+                "cy": 0.5 * (y1 + y2),
+                "w": x2 - x1,
+                "h": y2 - y1,
+            }
+
+        out = {
+            "available": False,
+            "schema": "custom_yolo_chest_v2_strict" if isinstance(md.get("chest"), dict) else "none",
+            "quality": 0.0,
+            "chest_visibility_weight": 0.0,
+            "left_breast_visibility": 0.0,
+            "right_breast_visibility": 0.0,
+            "sternum_visibility": 0.0,
+            "left_nipple": {"visible": False, "confidence": 0.0, "x": None, "y": None},
+            "right_nipple": {"visible": False, "confidence": 0.0, "x": None, "y": None},
+            "left_areola": {"visible": False, "confidence": 0.0, "x": None, "y": None},
+            "right_areola": {"visible": False, "confidence": 0.0, "x": None, "y": None},
+            "left_bust_bbox": {"visible": False, "confidence": 0.0, "bbox": None},
+            "right_bust_bbox": {"visible": False, "confidence": 0.0, "bbox": None},
+            "left_imf_curve": {"visible": False, "confidence": 0.0, "points": []},
+            "right_imf_curve": {"visible": False, "confidence": 0.0, "points": []},
+            "sternum_midline": {"visible": False, "confidence": 0.0, "points": []},
+            "chest_view": "unknown",
+            "detections_raw_count": 0,
+            "detections_filtered_count": 0,
+        }
+
+        strict_gates = self._normalize_breast_fit_gates(md.get("breast_fit_gates", None))
+        out["breast_fit_gates"] = strict_gates
+        md["breast_fit_gates"] = strict_gates
+
+        chest = md.get("chest", {}) or {}
+        geom = md.get("chest_geometry", {}) or {}
+        if not isinstance(chest, dict) or not chest:
+            md["chest_landmarks_scaled"] = out
+            md["chest_visible"] = 0.0
+            md["left_breast_visibility"] = 0.0
+            md["right_breast_visibility"] = 0.0
+            md["sternum_visibility"] = 0.0
+            return md
+
+        out["available"] = True
+        out["chest_view"] = str(chest.get("view", geom.get("view", md.get("pose_view", "unknown"))))
+        out["chest_visibility_weight"] = _clip01(md.get("chest_visible", 0.0), 0.0) * _clip01(md.get("quality_score", 1.0), 1.0)
+
+        for side in ["left", "right"]:
+            sd = chest.get(side, {}) or {}
+            side_visible = bool(sd.get("visible", chest.get(f"{side}_visible", False)))
+            nipple_c = _clip01(sd.get("nipple_confidence", 0.0))
+            areola_c = _clip01(sd.get("areola_confidence", 0.0))
+            bust_c = _clip01(sd.get("bust_confidence", 0.0))
+            imf_c = _clip01(sd.get("imf_confidence", 0.0))
+            side_conf = 0.45 * nipple_c + 0.35 * areola_c + 0.12 * bust_c + 0.08 * imf_c
+            if side_visible and side_conf > 0.0:
+                side_conf = max(0.45, side_conf)
+            elif side_visible:
+                side_conf = 0.0
+            out[f"{side}_breast_visibility"] = _clip01(side_conf, 0.0)
+            diam = sd.get("areola_diameter_px", None)
+            out[f"{side}_nipple"] = scale_point(
+                sd.get("nipple"),
+                confidence=sd.get("nipple_confidence", 0.0),
+                visible=side_visible and sd.get("nipple") is not None,
+                extra={"source": sd.get("source"), "areola_diameter_px": diam, "kind": "nipple"},
+            )
+            out[f"{side}_areola"] = scale_point(
+                sd.get("areola_center"),
+                confidence=sd.get("areola_confidence", 0.0),
+                visible=side_visible and sd.get("areola_center") is not None,
+                extra={"source": sd.get("source"), "areola_diameter_px": diam, "kind": "areola"},
+            )
+            out[f"{side}_bust_bbox"] = scale_bbox(
+                sd.get("bust_bbox"),
+                confidence=sd.get("bust_confidence", 0.0),
+                visible=side_visible and sd.get("bust_bbox") is not None,
+            )
+            out[f"{side}_imf_curve"] = scale_curve(
+                sd.get("imf_curve"),
+                confidence=sd.get("imf_confidence", 0.0),
+                visible=side_visible and sd.get("imf_curve") is not None,
+            )
+
+        stern = chest.get("sternum", {}) or {}
+        stern_line = stern.get("line", None)
+        if stern_line is None:
+            stern_line = geom.get("midline", None)
+        out["sternum_midline"] = scale_curve(
+            stern_line,
+            confidence=stern.get("confidence", 0.0 if stern_line is None else 0.5),
+            visible=stern_line is not None,
+        )
+        out["sternum_visibility"] = _clip01(stern.get("confidence", 0.0 if stern_line is None else 0.5), 0.0)
+
+        det = md.get("detections", {}) or {}
+        out["detections_raw_count"] = int(det.get("raw_count", len(det.get("raw", []) or [])) or 0)
+        out["detections_filtered_count"] = int(det.get("filtered_count", len(det.get("filtered", []) or [])) or 0)
+
+        qvals = [out["chest_visibility_weight"], out["left_breast_visibility"], out["right_breast_visibility"], out["sternum_visibility"]]
+        for side in ["left", "right"]:
+            qvals.append(out[f"{side}_nipple"].get("confidence", 0.0))
+            qvals.append(out[f"{side}_areola"].get("confidence", 0.0))
+            qvals.append(out[f"{side}_imf_curve"].get("confidence", 0.0))
+            qvals.append(out[f"{side}_bust_bbox"].get("confidence", 0.0))
+        qvals = [float(q) for q in qvals if float(q) > 0]
+        out["quality"] = float(np.clip(np.mean(qvals), 0.0, 1.0)) if qvals else 0.0
+
+        md["chest_landmarks_scaled"] = out
+        md["chest_visible"] = float(out.get("chest_visibility_weight", 0.0) or 0.0)
+        md["left_breast_visibility"] = float(out.get("left_breast_visibility", 0.0) or 0.0)
+        md["right_breast_visibility"] = float(out.get("right_breast_visibility", 0.0) or 0.0)
+        md["sternum_visibility"] = float(out.get("sternum_visibility", 0.0) or 0.0)
+        return md
+
+    def _point_gaussian(self, x, y, sigma_px):
+        H=W=self.image_size
+        gx=torch.arange(W, device=self.device, dtype=torch.float32).view(1,1,1,W)
+        gy=torch.arange(H, device=self.device, dtype=torch.float32).view(1,1,H,1)
+        sigma=max(float(sigma_px), 1.5)
+        return torch.exp(-((gx-float(x)).pow(2)+(gy-float(y)).pow(2))/(2.0*sigma*sigma)).clamp(0.0,1.0)
+
+    def _curve_gaussian(self, points, sigma_px=3.0):
+        g=torch.zeros(1,1,self.image_size,self.image_size,device=self.device)
+        for p in (points or []):
+            if p is not None and len(p)>=2:
+                g=torch.maximum(g, self._point_gaussian(float(p[0]), float(p[1]), sigma_px))
+        return g.clamp(0.0,1.0)
+
+    def _soft_edge_map(self, mask):
+        kx=torch.tensor([[[-1,0,1],[-2,0,2],[-1,0,1]]],dtype=torch.float32,device=self.device).unsqueeze(0)
+        ky=torch.tensor([[[-1,-2,-1],[0,0,0],[1,2,1]]],dtype=torch.float32,device=self.device).unsqueeze(0)
+        ex=F.conv2d(mask,kx,padding=1); ey=F.conv2d(mask,ky,padding=1)
+        e=torch.sqrt(ex.pow(2)+ey.pow(2)+1e-6)
+        return (e/(e.detach().amax().clamp(min=1e-6))).clamp(0.0,1.0)
+
+    def _rect_mask(self, bbox, soft_px=4.0):
+        """Differentiable-ish rectangular support mask in screen space."""
+        if bbox is None or len(bbox)<4:
+            return torch.zeros(1,1,self.image_size,self.image_size,device=self.device)
+        x1,y1,x2,y2=[float(v) for v in bbox[:4]]
+        x1,x2=sorted([x1,x2]); y1,y2=sorted([y1,y2])
+        gx=torch.arange(self.image_size, device=self.device, dtype=torch.float32).view(1,1,1,self.image_size)
+        gy=torch.arange(self.image_size, device=self.device, dtype=torch.float32).view(1,1,self.image_size,1)
+        s=max(float(soft_px),1.0)
+        left=torch.sigmoid((gx-x1)/s)
+        right=torch.sigmoid((x2-gx)/s)
+        top=torch.sigmoid((gy-y1)/s)
+        bottom=torch.sigmoid((y2-gy)/s)
+        return (left*right*top*bottom).clamp(0.0,1.0)
+
+    def _chest_landmark_losses(self, rendered_body_mask, rendered_chest_mask, target_mask, validity, metadata):
+        """
+        Landmark losses for chest-aware visibility metadata.
+
+        Consumes metadata["chest_landmarks_scaled"], which is produced by
+        _scale_chest_analysis_landmarks and the current custom-YOLO visibility
+        schema. The losses are deliberately soft: detector output
+        guides local support and folds without overriding full silhouette terms.
+        """
+        z=torch.tensor(0.0,device=self.device)
+        lm=metadata.get("chest_landmarks_scaled", {}) or {}
+        if not lm.get("available", False):
+            return z,z,z,z,z,z,z,z
+        cv=float(lm.get("chest_visibility_weight", metadata.get("chest_visible",0.0)) or 0.0)
+        if cv<=0.05:
+            return z,z,z,z,z,z,z,z
+
+        rendered_chest=rendered_chest_mask.clamp(0.0,1.0)
+        rendered_body=rendered_body_mask.clamp(0.0,1.0)
+        valid=validity.clamp(0.0,1.0)
+        tgt=target_mask.clamp(0.0,1.0)
+        breast_core=self.region_maps.get("breast_fit", self.region_maps["breast"])
+        sternum_guard=self.region_maps.get("sternum", torch.zeros_like(breast_core))
+        breast_region=(0.85*breast_core+0.15*self.region_maps["chest"]).clamp(0.0,1.0)*(1.0-0.75*sternum_guard)
+
+        nipple_loss=z; imf_loss=z; areola_loss=z; sternum_loss=z; cleavage_loss=z
+        lm_count=0.0; conf_acc=0.0; nipple_points=[]
+
+        def _point_term(d, side_vis, kind="nipple"):
+            if not (d.get("visible",False) and d.get("x") is not None and d.get("y") is not None):
+                return z, None, 0.0
+            c=float(d.get("confidence",0.0) or 0.0)*float(side_vis or 1.0)*cv
+            if c<=0.0:
+                return z, None, 0.0
+            x=float(d["x"]); y=float(d["y"])
+            diam=d.get("areola_diameter_px", None)
+            # Nipple point should be sharper than the areola center. Areola center
+            # is a broader support cue and weaker than nipple.
+            if kind=="nipple":
+                sigma=max(2.5, float(diam)*0.22 if diam is not None else self.image_size*0.007)
+                strength=1.0
+            else:
+                sigma=max(4.0, float(diam)*0.45 if diam is not None else self.image_size*0.012)
+                strength=0.45
+            g=self._point_gaussian(x,y,sigma)*valid*breast_region
+            denom=g.sum().clamp(min=1.0)
+            loss=strength*c*((1.0-rendered_chest)*g).sum()/denom
+            loss=loss + 0.25*strength*c*((1.0-rendered_body)*g).sum()/denom
+            if kind=="areola" and diam is not None:
+                # Encourage the rendered chest to occupy the local areola region,
+                # but do not force the whole body silhouette to exactly match a box.
+                loss=loss + 0.20*c*((rendered_chest*g).sum()/denom - (tgt*g).sum().detach()/denom).pow(2)
+            return loss, (x,y,c), c
+
+        for side in ["left","right"]:
+            side_vis=float(lm.get(f"{side}_breast_visibility",1.0) or 1.0)
+            # Nipple center from detector.
+            loss,pt,c=_point_term(lm.get(f"{side}_nipple",{}) or {}, side_vis, kind="nipple")
+            nipple_loss=nipple_loss+loss
+            if pt is not None:
+                nipple_points.append(pt); lm_count+=1.0; conf_acc+=c
+            # Areola center/diameter from detector. This remains useful even
+            # when nipple is absent or lower confidence.
+            loss,pt,c=_point_term(lm.get(f"{side}_areola",{}) or {}, side_vis, kind="areola")
+            areola_loss=areola_loss+loss
+            if pt is not None:
+                lm_count+=1.0; conf_acc+=c
+            # Bust bbox: weak support cue for visible breast volume. This is not
+            # a hard box fitting term because YOLO bust boxes can be broad.
+            bd=lm.get(f"{side}_bust_bbox",{}) or {}
+            bc=float(bd.get("confidence",0.0) or 0.0)*side_vis*cv
+            if bd.get("visible",False) and bd.get("bbox") is not None and bc>0.0:
+                rg=self._rect_mask(bd.get("bbox"), soft_px=max(3.0,self.image_size*0.010))*valid*breast_region
+                denom=rg.sum().clamp(min=1.0)
+                # Use a small multiplier so a broad bust box cannot overpower
+                # silhouette / keypoint / nipple terms.
+                areola_loss=areola_loss + 0.18*bc*((1.0-rendered_chest)*rg).sum()/denom
+                lm_count+=1.0; conf_acc+=bc
+
+        edge=self._soft_edge_map(rendered_chest)
+        for side in ["left","right"]:
+            side_vis=float(lm.get(f"{side}_breast_visibility",1.0) or 1.0)
+            d=lm.get(f"{side}_imf_curve",{}) or {}; pts=d.get("points",[]) or []
+            c=float(d.get("confidence",0.0) or 0.0)*side_vis*cv
+            if d.get("visible",False) and len(pts)>=2 and c>0:
+                g=self._curve_gaussian(pts, sigma_px=max(2.5,self.image_size*0.006))*valid*breast_region
+                denom=g.sum().clamp(min=1.0)
+                # IMF should align with a rendered chest edge/crease and avoid
+                # excessive rendered overfill below the visible fold.
+                imf_loss=imf_loss + c*((1.0-edge)*g).sum()/denom
+                imf_loss=imf_loss + 0.25*c*(rendered_chest*g*(1.0-tgt)).sum()/denom
+                lm_count+=1.0; conf_acc+=c
+
+        sd=lm.get("sternum_midline",{}) or {}; spts=sd.get("points",[]) or []
+        c=float(sd.get("confidence",0.0) or 0.0)*float(lm.get("sternum_visibility",1.0) or 1.0)*cv
+        if sd.get("visible",False) and len(spts)>=2 and c>0:
+            sg=self._curve_gaussian(spts, sigma_px=max(3.0,self.image_size*0.008))*valid
+            denom=sg.sum().clamp(min=1.0)
+            # Sternum line is a no-breast / cleavage-gap guide. Penalize chest
+            # filling the central line and full-body overfill along it.
+            sternum_loss=sternum_loss + c*(rendered_chest*sg).sum()/denom
+            cleavage_loss=cleavage_loss + c*(F.relu(rendered_body-target_mask)*sg).sum()/denom
+            lm_count+=1.0; conf_acc+=c
+
+        # If both nipples are available, use the connecting segment as a weak
+        # cleavage/inter-breast overfill guard.
+        if len(nipple_points)>=2:
+            # Pick the two highest-confidence point detections.
+            nipple_points=sorted(nipple_points, key=lambda p:p[2], reverse=True)[:2]
+            (x1,y1,c1),(x2,y2,c2)=nipple_points[0],nipple_points[1]
+            pts=[[x1*(1-t)+x2*t, y1*(1-t)+y2*t] for t in np.linspace(0,1,16)]
+            cg=self._curve_gaussian(pts, sigma_px=max(3.0,self.image_size*0.010))*valid
+            denom=cg.sum().clamp(min=1.0)
+            cc=min(c1,c2)*cv
+            cleavage_loss=cleavage_loss + cc*(F.relu(rendered_body-target_mask)*cg).sum()/denom
+            lm_count+=1.0; conf_acc+=cc
+
+        return (
+            nipple_loss,
+            imf_loss,
+            areola_loss,
+            sternum_loss,
+            cleavage_loss,
+            torch.tensor(float(conf_acc/max(lm_count,1.0)) if lm_count>0 else 0.0,device=self.device),
+            torch.tensor(float(lm_count),device=self.device),
+            torch.tensor(float(cv),device=self.device),
+        )
+
     def _width_loss(self, rm, tw, m):
         rw=self._mask_band_widths(rm)
         loss=torch.tensor(0.0, device=self.device); active=0.0
@@ -944,14 +1818,17 @@ class MultiImageOptimizer:
         if cv<=0.35:
             z=torch.tensor(0.0, device=self.device)
             return z,z,z
-        cp=(0.60*self.region_maps["chest"]+1.00*self.region_maps["breast"]).clamp(0.0,1.0)
+        breast_core=self.region_maps.get("breast_fit", self.region_maps["breast"])
+        sternum_guard=self.region_maps.get("sternum", torch.zeros_like(breast_core))
+        cp=(0.45*self.region_maps["chest"]+1.00*breast_core).clamp(0.0,1.0)*(1.0-0.70*sternum_guard)
         tgt=tm*cp
         fp=cm*(1.0-tm); fn=tgt*(1.0-cm)
         lcs=fp.mean()+0.75*fn.mean()
         cw=self._mask_band_widths(cm)
         lw=(1.50*(cw["breast"]-tw["breast"]).pow(2)+0.90*(cw["chest"]-tw["chest"]).pow(2)+0.60*(cw["underbust"]-tw["underbust"]).pow(2))/3.0
-        ca=(cm*self.region_maps["breast"]).sum()/self.region_maps["breast"].sum().clamp(min=1.0)
-        ta=(tm*self.region_maps["breast"]).sum()/self.region_maps["breast"].sum().clamp(min=1.0)
+        area_band=self.region_maps.get("breast_fit", self.region_maps["breast"])
+        ca=(cm*area_band).sum()/area_band.sum().clamp(min=1.0)
+        ta=(tm*area_band).sum()/area_band.sum().clamp(min=1.0)
         la=(ca-ta).pow(2)
         return lcs,lw,la
 
@@ -1507,7 +2384,9 @@ class MultiImageOptimizer:
         Late chest offsets should explain only local missing breast/chest
         residuals from the anchored body fit, while avoiding new outside pixels.
         """
-        breast_region=(0.65*self.region_maps["breast"]+0.35*self.region_maps["chest"]).clamp(0.0,1.0)
+        breast_core=self.region_maps.get("breast_fit", self.region_maps["breast"])
+        sternum_guard=self.region_maps.get("sternum", torch.zeros_like(breast_core))
+        breast_region=(0.80*breast_core+0.20*self.region_maps["chest"]).clamp(0.0,1.0)*(1.0-0.75*sternum_guard)
         pos_residual=F.relu(target_mask-anchor_mask)*breast_region*valid
         coverage=(pos_residual*(1.0-chest_mask)).mean()
         outside=(chest_mask*(1.0-target_mask)*breast_region*valid).mean()
@@ -1603,7 +2482,7 @@ class MultiImageOptimizer:
         delayed["train_focal"]=True
         delayed["lr"]=min(float(cfg.get("lr",0.006)), 0.006)
         # Turn off chest-local losses while waiting for a strong anchor.
-        for k in ["chest_proj","chest_width","chest_area","bilat_w","bilat_a","bilat_c","cleavage","sternum","gap","chest_reg","chest_residual"]:
+        for k in ["chest_proj","chest_width","chest_area","bilat_w","bilat_a","bilat_c","cleavage","sternum","gap","chest_reg","chest_residual","nipple_lm","imf_lm","areola_lm","sternum_lm","cleavage_lm"]:
             delayed[k]=0.0
         # Keep shape/silhouette active but moderate.
         delayed["anchor_joint"]=0.0
@@ -1615,6 +2494,134 @@ class MultiImageOptimizer:
         delayed["trans"]=0.045
         delayed["focal_reg"]=0.035
         return delayed
+
+
+    def _init_breast_soft_tissue_layer(self, model_path):
+        """Create the optional breast soft-tissue layer if prior/weights exist."""
+        candidates_prior=[]
+        candidates_weights=[]
+        if self.breast_prior_json is not None:
+            candidates_prior.append(self.breast_prior_json)
+        if self.breast_weights_npz is not None:
+            candidates_weights.append(self.breast_weights_npz)
+
+        # Project-local defaults. These make the feature plug-and-play once the
+        # generated assets are copied into a repo assets/models folder.
+        cwd=Path.cwd()
+        candidates_prior += [
+            cwd / "assets" / "smplx_female_breast_topology_prior.json",
+            cwd / "models" / "smplx" / "smplx_female_breast_topology_prior.json",
+            Path(model_path).parent / "smplx_female_breast_topology_prior.json",
+        ]
+        candidates_weights += [
+            cwd / "assets" / "smplx_female_breast_soft_weights.npz",
+            cwd / "models" / "smplx" / "smplx_female_breast_soft_weights.npz",
+            Path(model_path).parent / "smplx_female_breast_soft_weights.npz",
+        ]
+
+        prior_path=next((Path(x) for x in candidates_prior if Path(x).exists()), None)
+        weights_path=next((Path(x) for x in candidates_weights if Path(x).exists()), None)
+        if prior_path is None or weights_path is None:
+            print("⚠ breast soft-tissue layer disabled: prior_json or weights_npz not found")
+            self.use_breast_soft_tissue=False
+            self.breast_soft=None
+            return
+
+        self.breast_prior_json=prior_path
+        self.breast_weights_npz=weights_path
+        self.breast_soft=BreastSoftTissueModel(
+            prior_json=prior_path,
+            weights_npz=weights_path,
+            device=self.device,
+            dtype=torch.float32,
+        ).to(self.device)
+        print(f"✓ Breast soft-tissue layer enabled: prior={prior_path}, weights={weights_path}")
+
+    def _apply_breast_soft_tissue(self, vertices, joints, stage="full"):
+        if self.breast_soft is None:
+            return vertices
+        return self.breast_soft(vertices, joints, stage=stage)
+
+    def _breast_soft_landmark_losses(self, vertices, fl, cc, t, metadata):
+        """
+        Directly align topology-prior nipple / IMF anchor vertices to visibility
+        analysis landmarks. This is intentionally weak and confidence-gated;
+        the silhouette/chest-mask losses remain the main shape drivers.
+        """
+        if self.breast_soft is None:
+            z=torch.tensor(0.0, device=self.device)
+            return z,z,z,z
+        lm=(metadata or {}).get("chest_landmarks_scaled", {}) or {}
+        anchors=self.breast_soft.anchors
+        loss_n=torch.tensor(0.0, device=self.device)
+        loss_i=torch.tensor(0.0, device=self.device)
+        loss_a=torch.tensor(0.0, device=self.device)
+        count_n=torch.tensor(0.0, device=self.device)
+        count_i=torch.tensor(0.0, device=self.device)
+        count_a=torch.tensor(0.0, device=self.device)
+
+        def _pt_loss(vertex_id, target, confidence_floor=0.25):
+            if vertex_id is None or not target or not target.get("visible", False):
+                return None, None
+            conf=float(target.get("confidence", 0.0) or 0.0)
+            if conf < confidence_floor or target.get("x") is None or target.get("y") is None:
+                return None, None
+            vid=int(vertex_id)
+            p2=self._project_points_screen(vertices[:,vid:vid+1,:], f=fl, cc=cc, t=t)[:,0,:]
+            tgt=torch.tensor([[float(target["x"]), float(target["y"])]], dtype=torch.float32, device=self.device)
+            # Robust pixel error normalized by image size.
+            d=torch.linalg.norm(p2-tgt, dim=-1) / float(self.image_size)
+            return F.smooth_l1_loss(d, torch.zeros_like(d), beta=0.02), torch.tensor(conf, device=self.device)
+
+        def _curve_loss(vertex_id, curve, confidence_floor=0.20):
+            if vertex_id is None or not curve or not curve.get("visible", False):
+                return None, None
+            conf=float(curve.get("confidence", 0.0) or 0.0)
+            pts=curve.get("points", []) or []
+            if conf < confidence_floor or len(pts) < 2:
+                return None, None
+            vid=int(vertex_id)
+            p2=self._project_points_screen(vertices[:,vid:vid+1,:], f=fl, cc=cc, t=t)[:,0,:]
+            tgt=torch.tensor([[float(x), float(y)] for x,y in pts], dtype=torch.float32, device=self.device).view(1,-1,2)
+            d=torch.linalg.norm(p2[:,None,:]-tgt, dim=-1).amin(dim=1) / float(self.image_size)
+            return F.smooth_l1_loss(d, torch.zeros_like(d), beta=0.02), torch.tensor(conf, device=self.device)
+
+        side_specs=[
+            ("left", anchors.get("left_nipple_prior_vertex"), anchors.get("left_imf_mid_vertex")),
+            ("right", anchors.get("right_nipple_prior_vertex"), anchors.get("right_imf_mid_vertex")),
+        ]
+        for side,nvid,ivid in side_specs:
+            # Use the scaled visibility confidence as a side-level gate. With the
+            # custom YOLO schema this already applies the weighted confidence and
+            # floor from _scale_chest_analysis_landmarks().
+            side_gate=float(lm.get(f"{side}_breast_visibility", 0.0) or 0.0)
+            if side_gate <= 0.0:
+                continue
+            side_w=torch.tensor(max(self.breast_only_confidence_floor, side_gate), device=self.device)
+
+            # Prefer nipple, but use areola center as a weaker substitute if nipple
+            # is missing. The substitute is intentionally not allowed to dominate
+            # a real nipple landmark.
+            l,w=_pt_loss(nvid, lm.get(f"{side}_nipple"), confidence_floor=0.20)
+            if l is not None:
+                ww=torch.maximum(w, side_w)
+                loss_n=loss_n + ww*l; count_n=count_n+ww
+            else:
+                l,w=_pt_loss(nvid, lm.get(f"{side}_areola"), confidence_floor=0.25)
+                if l is not None:
+                    ww=0.65*torch.maximum(w, side_w)
+                    loss_a=loss_a + ww*l; count_a=count_a+ww
+
+            l,w=_curve_loss(ivid, lm.get(f"{side}_imf_curve"), confidence_floor=0.15)
+            if l is not None:
+                ww=torch.maximum(w, side_w)
+                loss_i=loss_i + ww*l; count_i=count_i+ww
+
+        loss_n=loss_n/count_n.clamp(min=1.0)
+        loss_i=loss_i/count_i.clamp(min=1.0)
+        loss_a=loss_a/count_a.clamp(min=1.0)
+        total=(self.breast_soft_nipple_weight*loss_n + self.breast_soft_imf_weight*loss_i + self.breast_soft_areola_weight*loss_a)
+        return total, loss_n, loss_i, loss_a
 
     def _phase_config(self, it, its):
         """
@@ -1640,16 +2647,18 @@ class MultiImageOptimizer:
             "abdomen":0.00,"abdomen_area":0.00,"waist":0.00,
             "glute_w":0.00,"glute_a":0.00,"glute_bloat":0.00,
             "chest_reg":0.00,
+            "nipple_lm":0.00,"imf_lm":0.00,"areola_lm":0.00,"sternum_lm":0.00,"cleavage_lm":0.00,
             "anchor_joint":0.00,"anchor_pose":0.00,"anchor_camera":0.00,"anchor_beta":0.00,"sil_guard":0.00,
             "chest_residual":0.00,
             "lb_kp":0.00,"lb_ctr":0.00,"lb_dir":0.00,"lb_reproj":0.00,
+            "breast_soft_reg":0.00,"breast_soft_guard":0.00,"breast_soft_lm":0.00,
         }
 
         if f<0.25:
             cfg={"name":"camera_torso","kp":120.0,"bone":50.0,"center":80.0,
                  "mask_stats":18.0*self.mask_stats_weight,"sil":0.03,"dist":0.40,"iou":0.15,"edge":0.00,
                  "shape":1.00,"beta":0.75,"pose":0.010,"trans":0.08,"focal_reg":0.12,
-                 "train_betas":False,"train_chest":False,"train_pose":True,"train_orient":True,"train_trans":True,"train_focal":True,
+                 "train_betas":False,"train_chest":False,"train_breast_soft":False,"train_pose":True,"train_orient":True,"train_trans":True,"train_focal":True,
                  "torso_only":True,"lr":0.025}
             cfg.update(base_zero_regions); return cfg
 
@@ -1661,7 +2670,7 @@ class MultiImageOptimizer:
                  "arm_reduce":0.20*self.arm_silhouette_reduction,
                  "lb_kp":2.30,"lb_ctr":1.40,"lb_dir":1.10,"lb_reproj":0.12,
                  "shape":0.90,"beta":0.65,"pose":0.010,"trans":0.06,"focal_reg":0.06,
-                 "train_betas":False,"train_chest":False,"train_pose":True,"train_orient":True,"train_trans":True,"train_focal":True,
+                 "train_betas":False,"train_chest":False,"train_breast_soft":False,"train_pose":True,"train_orient":True,"train_trans":True,"train_focal":True,
                  "torso_only":False,"lr":0.018}
             cfg.update({k:v for k,v in base_zero_regions.items() if k not in cfg}); return cfg
 
@@ -1686,6 +2695,7 @@ class MultiImageOptimizer:
                     "glute_w":self.glute_width_weight*0.35*r,
                     "glute_a":self.glute_area_weight*0.35*r,
                     "glute_bloat":self.glute_bloat_weight*0.35*r,
+                    "nipple_lm":0.00,"imf_lm":0.00,"areola_lm":0.00,"sternum_lm":0.00,"cleavage_lm":0.00,
                     "anchor_joint":self.joint_anchor_weight*0.35,
                     "anchor_pose":self.pose_anchor_weight*0.35,
                     "anchor_camera":self.camera_anchor_weight*0.35,
@@ -1693,8 +2703,10 @@ class MultiImageOptimizer:
                     "sil_guard":self.silhouette_guard_weight*0.35,
                     "chest_residual":0.00,
                     "lb_kp":1.50,"lb_ctr":1.00,"lb_dir":0.80,"lb_reproj":0.08,
-                    "chest_reg":0.00,"shape":0.30,"beta":0.35,"pose":0.015,"trans":0.05,"focal_reg":0.035,
-                    "train_betas":True,"train_chest":False,"train_pose":True,"train_orient":True,"train_trans":True,"train_focal":True,
+                    "chest_reg":0.00,
+                    "breast_soft_reg":0.00,"breast_soft_guard":0.00,"breast_soft_lm":0.00,
+                    "shape":0.30,"beta":0.35,"pose":0.015,"trans":0.05,"focal_reg":0.035,
+                    "train_betas":True,"train_chest":False,"train_breast_soft":False,"train_pose":True,"train_orient":True,"train_trans":True,"train_focal":True,
                     "torso_only":False,"lr":0.010}
 
         if f<0.95:
@@ -1727,9 +2739,18 @@ class MultiImageOptimizer:
                     "anchor_beta":self.beta_anchor_weight*1.50,
                     "sil_guard":self.silhouette_guard_weight,
                     "chest_residual":0.00,
+                    "nipple_lm":self.nipple_landmark_weight*0.25,
+                    "imf_lm":self.imf_landmark_weight*0.20,
+                    "areola_lm":self.areola_landmark_weight*0.10,
+                    "sternum_lm":self.sternum_landmark_weight*0.35,
+                    "cleavage_lm":self.cleavage_landmark_weight*0.35,
                     "lb_kp":1.00,"lb_ctr":0.60,"lb_dir":0.50,"lb_reproj":0.05,
-                    "chest_reg":0.00,"shape":0.18,"beta":0.40,"pose":0.020,"trans":0.06,"focal_reg":0.04,
-                    "train_betas":True,"train_chest":False,
+                    "chest_reg":0.00,
+                    "breast_soft_reg":self.breast_soft_regularization_weight*0.35*r,
+                    "breast_soft_guard":self.breast_soft_guard_weight*0.35*r,
+                    "breast_soft_lm":self.breast_soft_landmark_weight*0.35*r,
+                    "shape":0.18,"beta":0.40,"pose":0.020,"trans":0.06,"focal_reg":0.04,
+                    "train_betas":True,"train_chest":False,"train_breast_soft":False,
                     # Critical: freeze pose/camera in region phase so shape cannot
                     # damage a good reprojection solution.
                     "train_pose":False,"train_orient":False,"train_trans":False,"train_focal":False,
@@ -1767,11 +2788,19 @@ class MultiImageOptimizer:
                 "anchor_beta":self.beta_anchor_weight*3.00,
                 "sil_guard":self.silhouette_guard_weight*1.30,
                 "chest_residual":self.chest_residual_weight*r,
+                "nipple_lm":self.nipple_landmark_weight*r,
+                "imf_lm":self.imf_landmark_weight*r,
+                "areola_lm":self.areola_landmark_weight*r,
+                "sternum_lm":self.sternum_landmark_weight*r,
+                "cleavage_lm":self.cleavage_landmark_weight*r,
                 "lb_kp":0.80,"lb_ctr":0.50,"lb_dir":0.40,"lb_reproj":0.04,
                 "chest_reg":self.chest_offset_weight*1.20,
+                "breast_soft_reg":self.breast_soft_regularization_weight*r,
+                "breast_soft_guard":self.breast_soft_guard_weight*r,
+                "breast_soft_lm":self.breast_soft_landmark_weight*r,
                 "shape":0.10,"beta":0.50,"pose":0.030,"trans":0.08,"focal_reg":0.05,
-                # Critical final phase: local chest offsets only.
-                "train_betas":False,"train_chest":True,
+                # Critical final phase: local chest offsets and soft breast controls only.
+                "train_betas":False,"train_chest":True,"train_breast_soft":False,
                 "train_pose":False,"train_orient":False,"train_trans":False,"train_focal":False,
                 "torso_only":False,"lr":0.004}
 
@@ -1785,6 +2814,8 @@ class MultiImageOptimizer:
         self._set_trainable(go.parameters(), cfg["train_orient"])
         self._set_trainable(tr.parameters(), cfg["train_trans"])
         if lfs is not None: lfs.requires_grad_(cfg["train_focal"])
+        if self.breast_soft is not None:
+            self._set_trainable(self.breast_soft.parameters(), bool(cfg.get("train_breast_soft", False)))
         params=[]
         if betas.requires_grad: params.append({"params":[betas],"lr":cfg["lr"]*0.20})
         if cos is not None and cos.requires_grad: params.append({"params":[cos],"lr":cfg["lr"]*0.35})
@@ -1795,8 +2826,540 @@ class MultiImageOptimizer:
         if op: params.append({"params":op,"lr":cfg["lr"]*0.5})
         if tp: params.append({"params":tp,"lr":cfg["lr"]*0.5})
         if lfs is not None and lfs.requires_grad: params.append({"params":[lfs],"lr":cfg["lr"]*0.1})
+        if self.breast_soft is not None:
+            sp=[p for p in self.breast_soft.parameters() if p.requires_grad]
+            if sp:
+                params.append({"params":sp,"lr":min(cfg["lr"]*0.10, 0.001)})
         if not params: params=[{"params":[tr[0]],"lr":cfg["lr"]}]
         return torch.optim.Adam(params)
+
+
+    def _clamp_breast_soft_raw_params(self):
+        """Keep sigmoid controls in a useful anatomical range.
+
+        The raw values are not physical displacement values.  Values below -8
+        are effectively zero; values above 5 are already near the per-control
+        maxima and should not grow further.
+        """
+        if self.breast_soft is None:
+            return
+        with torch.no_grad():
+            for p in self.breast_soft.parameters():
+                p.clamp_(-8.0, 5.0)
+
+
+    def _normalize_breast_fit_gates(self, gates):
+        """Normalize strict v6 breast-fit gates from the automatic visibility analyzer.
+
+        Legacy compatibility has intentionally been removed. Missing/invalid
+        `breast_fit_gates` returns all-False gates and marks the image as not
+        explicitly gated, so the breast-only pass will not infer image authority
+        from older schemas.
+        """
+        required = [
+            "use_for_cleavage",
+            "use_for_sternum_valley",
+            "use_for_landmarks",
+            "use_for_projection",
+            "use_for_imf",
+        ]
+
+        def _as_bool(v):
+            if isinstance(v, bool):
+                return bool(v)
+            if isinstance(v, (int, float)):
+                return float(v) > 0.0
+            if isinstance(v, str):
+                return v.strip().lower() in {"1", "true", "yes", "y", "on"}
+            return False
+
+        def _as_float(v, default=1.0):
+            try:
+                return float(v)
+            except Exception:
+                return float(default)
+
+        valid = isinstance(gates, dict) and all(k in gates for k in required)
+        src = gates if isinstance(gates, dict) else {}
+        out = {
+            "explicit": bool(valid),
+            "use_for_cleavage": _as_bool(src.get("use_for_cleavage", False)) if valid else False,
+            "use_for_sternum_valley": _as_bool(src.get("use_for_sternum_valley", False)) if valid else False,
+            "use_for_landmarks": _as_bool(src.get("use_for_landmarks", False)) if valid else False,
+            "use_for_projection": _as_bool(src.get("use_for_projection", False)) if valid else False,
+            "use_for_imf": _as_bool(src.get("use_for_imf", False)) if valid else False,
+            "cleavage_weight": _as_float(src.get("cleavage_weight", 1.0), 1.0) if valid else 0.0,
+            "sternum_valley_weight": _as_float(src.get("sternum_valley_weight", 1.0), 1.0) if valid else 0.0,
+            "landmark_weight": _as_float(src.get("landmark_weight", 1.0), 1.0) if valid else 0.0,
+            "projection_weight": _as_float(src.get("projection_weight", 1.0), 1.0) if valid else 0.0,
+            "imf_weight": _as_float(src.get("imf_weight", 1.0), 1.0) if valid else 0.0,
+        }
+        return out
+
+    def _breast_refine_side_evidence(self, lm, side):
+        """Return confidence summary for one breast side in scaled visibility metadata."""
+        lm = lm or {}
+        def _conf(obj_name):
+            o = lm.get(f"{side}_{obj_name}", {}) or {}
+            try:
+                return float(o.get("confidence", 0.0) or 0.0) if bool(o.get("visible", False)) else 0.0
+            except Exception:
+                return 0.0
+        nipple = _conf("nipple")
+        areola = _conf("areola")
+        bust = _conf("bust_bbox")
+        imf = _conf("imf_curve")
+        side_vis = float(lm.get(f"{side}_breast_visibility", 0.0) or 0.0)
+        # Landmark evidence matters more than a one-sided bust box.  A bust/IMF-only
+        # side can support envelope/projection but should not drive cleavage.
+        apex = max(nipple, 0.92 * areola)
+        envelope = max(bust, imf)
+        score = max(side_vis, apex, 0.65 * bust, 0.60 * imf)
+        return {
+            "nipple": nipple,
+            "areola": areola,
+            "apex": apex,
+            "bust": bust,
+            "imf": imf,
+            "envelope": envelope,
+            "visibility": side_vis,
+            "score": float(max(0.0, min(1.0, score))),
+            "has_apex": apex >= self.breast_only_min_nipple_or_areola_conf,
+            "has_bust": bust >= self.breast_only_min_bust_conf,
+            "has_imf": imf >= self.breast_only_min_imf_conf,
+        }
+
+    def _breast_refine_visibility_gates(self, metadata_list):
+        """Build strict breast-only gates from visibility-analysis `breast_fit_gates`.
+
+        No legacy heuristic fallback is used.  The visibility analyzer is now the
+        single source of truth for whether an image can drive cleavage, sternum
+        valley, landmarks, projection, or IMF losses.  Confidence-derived values
+        still scale the strength of an enabled term, but they never enable a term
+        that the analyzer disabled.
+        """
+        gates = []
+        counts = {
+            "total": 0,
+            "cleavage": 0,
+            "landmark": 0,
+            "projection": 0,
+            "imf": 0,
+            "sternum_valley": 0,
+            "explicit_gate": 0,
+            "missing_gate": 0,
+            "frontal_both": 0,
+            "three_quarter": 0,
+            "lateral": 0,
+            "ignored_for_breast": 0,
+        }
+        for md in metadata_list:
+            md = md or {}
+            lm = md.get("chest_landmarks_scaled", {}) or {}
+            view = str(lm.get("chest_view", md.get("pose_view", md.get("view", "unknown"))) or "unknown").lower()
+            quality = float(md.get("quality_score", lm.get("quality", 0.0)) or 0.0)
+            chest_visible = float(md.get("chest_visible", lm.get("chest_visibility_weight", 0.0)) or 0.0)
+            stern = lm.get("sternum_midline", {}) or {}
+            stern_conf = float(stern.get("confidence", lm.get("sternum_visibility", md.get("sternum_visibility", 0.0))) or 0.0) if bool(stern.get("visible", False)) else 0.0
+            left = self._breast_refine_side_evidence(lm, "left")
+            right = self._breast_refine_side_evidence(lm, "right")
+            frontal = ("frontal" in view) or ("front" in view)
+            three_quarter = ("three" in view) or ("quarter" in view) or ("3" in view)
+            lateral = ("lateral" in view) or ("side" in view) or ("profile" in view)
+            both_score = min(left["score"], right["score"])
+            any_side = max(left["score"], right["score"])
+            any_projection = max(left["bust"], right["bust"], left["imf"], right["imf"])
+            high_quality = max(quality, chest_visible)
+
+            explicit_gates = self._normalize_breast_fit_gates(md.get("breast_fit_gates", lm.get("breast_fit_gates", None)))
+            explicit_gate_used = bool(explicit_gates.get("explicit", False))
+
+            use_cleavage = bool(explicit_gates.get("use_for_cleavage", False))
+            use_sternum_valley = bool(explicit_gates.get("use_for_sternum_valley", False))
+            use_landmark = bool(explicit_gates.get("use_for_landmarks", False))
+            use_projection = bool(explicit_gates.get("use_for_projection", False))
+            use_imf = bool(explicit_gates.get("use_for_imf", False))
+
+            # Confidence-derived weights only scale enabled analyzer gates.
+            landmark_weight = 0.0
+            if use_landmark:
+                landmark_weight = float(max(0.30, min(1.0, any_side)) * max(0.45, min(1.0, high_quality if high_quality > 0 else 0.7)))
+                landmark_weight *= float(explicit_gates.get("landmark_weight", 1.0))
+            cleavage_weight = 0.0
+            if use_cleavage:
+                cleavage_weight = float(max(0.35, min(1.0, both_score)) * max(0.50, min(1.0, stern_conf if stern_conf > 0 else 0.7)))
+                cleavage_weight *= float(explicit_gates.get("cleavage_weight", 1.0))
+            sternum_valley_weight = 0.0
+            if use_sternum_valley:
+                sternum_valley_weight = float(max(0.35, min(1.0, both_score)) * max(0.50, min(1.0, stern_conf if stern_conf > 0 else 0.7)))
+                sternum_valley_weight *= float(explicit_gates.get("sternum_valley_weight", 1.0))
+            chest_weight = 0.0
+            if use_projection:
+                view_scale = self.breast_only_lateral_chest_weight if lateral else (0.70 if three_quarter else 1.0)
+                chest_weight = float(max(0.25, min(1.0, any_projection if any_projection > 0 else any_side)) * view_scale)
+                chest_weight *= float(explicit_gates.get("projection_weight", 1.0))
+            imf_weight = 0.0
+            if use_imf:
+                imf_weight = float(max(left["imf"], right["imf"], 0.35) * (1.0 if frontal else 0.65))
+                imf_weight *= float(explicit_gates.get("imf_weight", 1.0))
+
+            gate = {
+                "view": view,
+                "quality": quality,
+                "chest_visible": chest_visible,
+                "sternum_conf": stern_conf,
+                "left": left,
+                "right": right,
+                "left_score": left["score"],
+                "right_score": right["score"],
+                "both_score": both_score,
+                "any_side_score": any_side,
+                "frontal": frontal,
+                "three_quarter": three_quarter,
+                "lateral": lateral,
+                "use_cleavage": use_cleavage,
+                "use_sternum_valley": use_sternum_valley,
+                "use_explicit_breast_fit_gates": explicit_gate_used,
+                "use_landmark": use_landmark,
+                "use_projection": use_projection,
+                "use_imf": use_imf,
+                "cleavage_weight": cleavage_weight,
+                "sternum_valley_weight": sternum_valley_weight,
+                "landmark_weight": landmark_weight,
+                "chest_weight": chest_weight,
+                "imf_weight": imf_weight,
+            }
+            gates.append(gate)
+            counts["total"] += 1
+            counts["cleavage"] += int(use_cleavage)
+            counts["landmark"] += int(use_landmark)
+            counts["projection"] += int(use_projection)
+            counts["imf"] += int(use_imf)
+            counts["sternum_valley"] += int(use_sternum_valley)
+            counts["explicit_gate"] += int(explicit_gate_used)
+            counts["missing_gate"] += int(not explicit_gate_used)
+            counts["frontal_both"] += int(frontal and both_score >= self.breast_only_min_both_side_score)
+            counts["three_quarter"] += int(three_quarter)
+            counts["lateral"] += int(lateral)
+            counts["ignored_for_breast"] += int(not (use_landmark or use_projection or use_cleavage or use_imf or use_sternum_valley))
+        return gates, counts
+
+    def _run_breast_only_refinement(
+        self,
+        betas,
+        cos,
+        bp,
+        go,
+        tr,
+        lfs,
+        cc,
+        masks,
+        valids,
+        meta,
+        tw_all,
+        iw,
+        debug_dir=None,
+    ):
+        """
+        Frozen-body parametric breast refinement.
+
+        This stage optimizes only the constrained BreastSoftTissueModel controls.
+        It never moves pose, camera, betas, global translation or local chest
+        offsets.  It uses staged losses so many iterations are safe:
+
+          0-25%   projection/volume only, strong regularization
+          25-70%  add nipple/areola/bust evidence and lower-pole support
+          70-100% add IMF fold evidence, still with hard guard/outside checks
+
+        The selected output is the best safe state, not necessarily the last
+        gradient step.
+        """
+        if self.breast_soft is None or (not self.breast_only_refine):
+            return {"enabled": False, "reason": "disabled_or_missing_layer"}
+
+        steps=int(max(0, self.breast_only_refine_iterations))
+        if steps <= 0:
+            return {"enabled": False, "reason": "zero_iterations"}
+
+        # Freeze everything except the anatomical breast controls.
+        betas.requires_grad_(False)
+        if cos is not None:
+            cos.requires_grad_(False)
+        self._set_trainable(bp.parameters(), False)
+        self._set_trainable(go.parameters(), False)
+        self._set_trainable(tr.parameters(), False)
+        if lfs is not None:
+            lfs.requires_grad_(False)
+        self._set_trainable(self.breast_soft.parameters(), True)
+
+        # Start breast-only from a small anatomical valley/separation prior. This
+        # avoids the near-zero sigmoid plateau that made previous breast phases
+        # run for 250 steps but visibly do nothing.
+        self.breast_soft.neutralize()
+        self.breast_soft.set_controls_from_targets({
+            "left_projection_m": 0.010,
+            "right_projection_m": 0.010,
+            "left_sag_m": 0.006,
+            "right_sag_m": 0.006,
+            "left_lower_fullness_m": 0.006,
+            "right_lower_fullness_m": 0.006,
+            "left_medial_separation_m": 0.012,
+            "right_medial_separation_m": 0.012,
+            "left_fold_depth_m": 0.003,
+            "right_fold_depth_m": 0.003,
+            "cleavage_valley_m": 0.014,
+        })
+
+        opt=torch.optim.Adam(
+            [p for p in self.breast_soft.parameters() if p.requires_grad],
+            lr=max(self.breast_only_refine_lr, 0.0012),
+        )
+
+        num_images=len(masks)
+        if self.breast_only_use_visibility_gating:
+            breast_gates, breast_gate_counts = self._breast_refine_visibility_gates(meta)
+        else:
+            breast_gates = [{
+                "use_cleavage": True, "use_landmark": True, "use_projection": True, "use_imf": True,
+                "cleavage_weight": 1.0, "landmark_weight": 1.0, "chest_weight": 1.0, "imf_weight": 1.0,
+                "view": "ungated", "left_score": 1.0, "right_score": 1.0, "both_score": 1.0,
+            } for _ in range(num_images)]
+            breast_gate_counts = {"total": num_images, "cleavage": num_images, "sternum_valley": num_images, "landmark": num_images, "projection": num_images, "imf": num_images, "explicit_gate": 0, "missing_gate": num_images, "ignored_for_breast": 0}
+        if breast_gate_counts.get("cleavage", 0) <= 0:
+            print("⚠ Breast-only refinement: no frontal both-side cleavage evidence; valley correction will be prior-driven only.")
+        print(
+            "✓ Breast-only visibility gates: "
+            f"cleavage={breast_gate_counts.get('cleavage',0)}/{num_images}, "
+            f"sternum_valley={breast_gate_counts.get('sternum_valley',0)}/{num_images}, "
+            f"landmark={breast_gate_counts.get('landmark',0)}/{num_images}, "
+            f"projection={breast_gate_counts.get('projection',0)}/{num_images}, "
+            f"imf={breast_gate_counts.get('imf',0)}/{num_images}, "
+            f"explicit={breast_gate_counts.get('explicit_gate',0)}/{num_images}, "
+            f"ignored={breast_gate_counts.get('ignored_for_breast',0)}/{num_images}"
+        )
+        cof=self._chest_offsets_full(cos).detach()
+        start_state={k:v.detach().clone() for k,v in self.breast_soft.state_dict().items()}
+        best_state={k:v.detach().clone() for k,v in self.breast_soft.state_dict().items()}
+        best_score=None
+        summary={
+            "enabled": True,
+            "iterations": steps,
+            "start": self.breast_soft.parameters_as_dict(),
+            "stage_schedule": "projection_0_20_volume_20_55_fold_55_100",
+            "visibility_gating": bool(self.breast_only_use_visibility_gating),
+            "visibility_gate_counts": breast_gate_counts,
+            "visibility_gates": breast_gates,
+        }
+
+        # Baseline outside/guard from zero/current controls.  The breast stage is
+        # not allowed to accept a state that becomes visibly worse than baseline.
+        with torch.no_grad():
+            baseline_outside=[]
+            baseline_guard=[]
+            for i in range(num_images):
+                out=self.model(betas=betas, body_pose=bp[i], global_orient=go[i], transl=None, return_verts=True)
+                base_verts=(out.vertices + cof).detach()
+                verts=base_verts
+                fl=self._current_focal(lfs, i)
+                rend=self.renderer.render(vertices=verts, faces=self.model.faces_tensor.unsqueeze(0), focal_length=fl, principal_point=cc, translation=tr[i])
+                rm=rend[...,3].unsqueeze(1)
+                _,_,_,lo=self._tight_fit_losses(rm, masks[i], valids[i].clamp(min=0.20, max=1.0))
+                baseline_outside.append(float(lo.detach().item()))
+                baseline_guard.append(float(self.breast_soft.guard_deformation_loss(base_verts, verts).detach().item()))
+            baseline_outside_mean=float(np.mean(baseline_outside)) if baseline_outside else 0.0
+            baseline_guard_mean=float(np.mean(baseline_guard)) if baseline_guard else 0.0
+        summary["baseline_outside"] = baseline_outside_mean
+        summary["baseline_guard"] = baseline_guard_mean
+
+        last={}
+        prog=tqdm(range(steps), desc="Breast-only refine")
+        faces_body=self.model.faces_tensor.unsqueeze(0)
+
+        for it in prog:
+            frac=it/max(1,steps-1)
+            if frac < 0.20:
+                stage="projection"
+                w_lm=0.00
+                w_imf=0.00
+                w_chest=0.25
+                w_outside=7.0
+                w_reg=18.0
+                w_guard=450.0
+                w_def=8.0
+                w_cleavage=0.0
+            elif frac < 0.55:
+                stage="volume"
+                w_lm=self.breast_only_landmark_weight*0.45
+                w_imf=0.00
+                w_chest=0.35
+                w_outside=7.0
+                w_reg=14.0
+                w_guard=450.0
+                w_def=6.0
+                w_cleavage=5.0
+            else:
+                stage="fold"
+                w_lm=self.breast_only_landmark_weight*0.65
+                w_imf=0.20
+                w_chest=0.25
+                w_outside=7.0
+                w_reg=10.0
+                w_guard=450.0
+                w_def=4.0
+                w_cleavage=12.0
+
+            opt.zero_grad()
+            total=torch.tensor(0.0, dtype=torch.float32, device=self.device)
+            acc={
+                "lm":0.0,"nipple":0.0,"imf":0.0,"areola":0.0,
+                "chest":0.0,"cleavage":0.0,"outside":0.0,"sil":0.0,"guard":0.0,"reg":0.0,"def":0.0,"maxdef":0.0,
+                "gate_lm":0.0,"gate_chest":0.0,"gate_cleavage":0.0,"gate_sternum":0.0,"gate_imf":0.0,
+            }
+
+            bsoft_reg=self.breast_soft.regularization_loss()
+            for i in range(num_images):
+                fl=self._current_focal(lfs, i)
+                with torch.no_grad():
+                    out=self.model(
+                        betas=betas,
+                        body_pose=bp[i],
+                        global_orient=go[i],
+                        transl=None,
+                        return_verts=True,
+                    )
+                    base_verts=(out.vertices + cof).detach()
+                    joints_det=out.joints.detach()
+
+                verts=self._apply_breast_soft_tissue(base_verts, joints_det, stage=stage)
+                rend=self.renderer.render(vertices=verts, faces=faces_body, focal_length=fl, principal_point=cc, translation=tr[i])
+                rm=rend[...,3].unsqueeze(1)
+                cr=self.renderer.render(vertices=verts, faces=self.chest_faces, focal_length=fl, principal_point=cc, translation=tr[i])
+                cm=cr[...,3].unsqueeze(1)
+                sj=SMPLXJointMapper.smplx_to_coco17(joints_det)
+                pj=self._project_points_screen(sj, fl, cc, tr[i])
+
+                md=meta[i]
+                gate=breast_gates[i] if i < len(breast_gates) else {}
+                g_lm=float(gate.get("landmark_weight", 1.0))
+                g_chest=float(gate.get("chest_weight", 1.0))
+                g_cleavage=float(gate.get("cleavage_weight", 1.0))
+                g_sternum=float(gate.get("sternum_valley_weight", g_cleavage))
+                # The current geometry loss handles both cleavage bridge and sternum valley.
+                # If either explicit gate is enabled, let the term contribute.
+                g_valley=max(g_cleavage, g_sternum)
+                g_imf=float(gate.get("imf_weight", 1.0))
+                silhouette_valid=valids[i].clamp(min=0.20, max=1.0)
+                lsil=silhouette_loss(rm, masks[i], silhouette_valid, self.sil_region_weights)
+                _, _, _, loutside=self._tight_fit_losses(rm, masks[i], silhouette_valid)
+                lcproj,lcw,lca=self._projected_chest_loss(cm, masks[i], tw_all[i], md)
+                lbsoft_guard=self.breast_soft.guard_deformation_loss(base_verts, verts)
+                lbsoft_def=self.breast_soft.deformation_loss(base_verts, verts)
+                lbsoft_maxdef=self.breast_soft.max_deformation_m(base_verts, verts)
+                lcleavage=self._interbreast_gap_loss(rm, cm, masks[i], pj, md)
+                lbsoft_lm,lbsoft_nipple,lbsoft_imf,lbsoft_areola=self._breast_soft_landmark_losses(verts, fl, cc, tr[i], md)
+
+                # IMF evidence enters only in the final stage and remains weak;
+                # it should shape a fold, not drag the whole breast downward.
+                if stage == "projection":
+                    lm_term = torch.tensor(0.0, dtype=torch.float32, device=self.device)
+                elif stage == "volume":
+                    lm_term = lbsoft_nipple + self.breast_soft_areola_weight * lbsoft_areola
+                else:
+                    lm_term = lbsoft_nipple + self.breast_soft_areola_weight * lbsoft_areola + (w_imf * g_imf) * lbsoft_imf
+
+                chest_term=lcproj + 0.65*lcw + 0.45*lca
+                image_weight=iw[i]
+                # Safety terms use every image.  Evidence terms are visibility-gated:
+                # - cleavage only from frontal/both-side evidence
+                # - landmarks from frontal/mild-3Q evidence
+                # - lateral views only weakly support projection/envelope
+                loss_i=image_weight*(
+                    (w_lm*g_lm)*lm_term
+                    + (w_chest*g_chest)*chest_term
+                    + (w_cleavage*g_valley)*lcleavage
+                    + w_outside*loutside
+                    + self.breast_only_silhouette_weight*lsil
+                    + w_guard*lbsoft_guard
+                    + w_def*lbsoft_def + 0.10*lbsoft_maxdef
+                )
+                total=total + loss_i
+
+                acc["lm"] += float(lbsoft_lm.detach().item())
+                acc["nipple"] += float(lbsoft_nipple.detach().item())
+                acc["imf"] += float(lbsoft_imf.detach().item())
+                acc["areola"] += float(lbsoft_areola.detach().item())
+                acc["chest"] += float(chest_term.detach().item())
+                acc["cleavage"] += float(lcleavage.detach().item())
+                acc["outside"] += float(loutside.detach().item())
+                acc["sil"] += float(lsil.detach().item())
+                acc["guard"] += float(lbsoft_guard.detach().item())
+                acc["def"] += float(lbsoft_def.detach().item())
+                acc["maxdef"] = max(acc["maxdef"], float(lbsoft_maxdef.detach().item()))
+                acc["gate_lm"] += g_lm
+                acc["gate_chest"] += g_chest
+                acc["gate_cleavage"] += g_cleavage
+                acc["gate_sternum"] += g_sternum
+                acc["gate_imf"] += g_imf
+
+            total=total + w_reg*bsoft_reg
+            acc["reg"]=float(bsoft_reg.detach().item())
+
+            # Best-state selection favors anatomical safety.  Landmarks can only
+            # win if outside/guard/deformation remain close to baseline.
+            denom=max(1, num_images)
+            mean_out=acc["outside"]/denom
+            mean_guard=acc["guard"]/denom
+            mean_def=acc["def"]/denom
+            mean_maxdef=acc.get("maxdef",0.0)
+            safe_penalty = (
+                10.0 * max(0.0, mean_out - baseline_outside_mean - 0.006)
+                + 5000.0 * max(0.0, mean_guard - baseline_guard_mean - 1e-6)
+                + 20.0 * mean_def
+                + 20.0 * max(0.0, mean_maxdef - 0.030)
+            )
+            # Cleavage/inter-breast overfill is the primary objective of this
+            # pass. Previous versions selected states with near-zero deformation
+            # because deformation/regularization dominated the score.
+            score=(acc["lm"]/denom) + 2.50*(acc.get("cleavage",0.0)/denom) + safe_penalty + 0.015*float(bsoft_reg.detach().item())
+            if best_score is None or score < best_score:
+                best_score=score
+                best_state={k:v.detach().clone() for k,v in self.breast_soft.state_dict().items()}
+
+            total.backward()
+            torch.nn.utils.clip_grad_norm_(list(self.breast_soft.parameters()), max_norm=0.35)
+            opt.step()
+            self._clamp_breast_soft_raw_params()
+
+            last={k:(v/denom if k not in ["reg", "maxdef"] else v) for k,v in acc.items()}
+            last["total"]=float(total.detach().item())
+            last["stage"]=stage
+            last["score"]=float(score)
+            if it % 10 == 0 or it == steps-1:
+                prog.set_postfix({
+                    "stage":stage,
+                    "total":f"{last['total']:.3f}",
+                    "lm":f"{last['lm']:.4f}",
+                    "out":f"{last['outside']:.4f}",
+                    "def":f"{last['def']:.6f}",
+                    "maxdef":f"{last.get('maxdef',0.0):.4f}",
+                })
+
+        if best_state is not None:
+            self.breast_soft.load_state_dict(best_state, strict=True)
+        self._set_trainable(self.breast_soft.parameters(), False)
+        summary["selected_score"]=float(best_score) if best_score is not None else None
+        summary["end"]=self.breast_soft.parameters_as_dict()
+        summary["last_losses"]=last
+        self._breast_only_refine_summary=summary
+        print(
+            "✓ Breast-only refinement complete: "
+            f"stage={last.get('stage','?')}, lm={last.get('lm',0.0):.5f}, "
+            f"nipple={last.get('nipple',0.0):.5f}, imf={last.get('imf',0.0):.5f}, "
+            f"cleavage={last.get('cleavage',0.0):.5f}, "
+            f"outside={last.get('outside',0.0):.5f}, def={last.get('def',0.0):.7f}, "
+            f"maxdef={last.get('maxdef',0.0):.5f}"
+        )
+        return summary
 
     def optimize(self, image_paths, pose_json_paths, visibility_json_paths, output_path, iterations=1000):
         print("\n🚀 Starting chest/abdomen/glute-aware multi-image optimization")
@@ -1826,6 +3389,7 @@ class MultiImageOptimizer:
             kn=self._load_scaled_pose(pose_json_paths[i], image_paths[i])
 
             md=load_visibility_json(visibility_json_paths[i])
+            md=self._scale_chest_analysis_landmarks(md, image_paths[i])
             md["pose_quality_score"]=pose_info["quality"]
             md["pose_image_weight"]=pose_info["image_weight"]
             md["pose_keypoint_weight"]=pose_info["keypoint_weight"]
@@ -1938,11 +3502,15 @@ class MultiImageOptimizer:
             cof=self._chest_offsets_full(cos)
             l2,sm,ow,iwd=self._chest_regularization(cos)
             lreg=self.chest_offset_l2_weight*l2 + self.chest_smooth_weight*sm + self.chest_outward_prior_weight*ow + self.chest_inward_prior_weight*iwd
+            # Breast soft-tissue is intentionally disabled during the main SMPL-X fit.
+            # It is a post-pass correction only; otherwise it contaminates camera/pose/body optimization.
+            bsoft_reg_global=torch.tensor(0.0, device=self.device)
 
             for i in range(num_images):
                 fl=self._current_focal(lfs, i)
                 out=self.model(betas=betas, body_pose=bp[i], global_orient=go[i], transl=None, return_verts=True)
-                verts=out.vertices + cof
+                base_verts=out.vertices + cof
+                verts=base_verts
                 joints=SMPLXJointMapper.smplx_to_coco17(out.joints)
                 pj=self._project_points_screen(joints, f=fl, cc=cc, t=tr[i])
 
@@ -1950,7 +3518,6 @@ class MultiImageOptimizer:
                 rm=rend[...,3].unsqueeze(1)
                 cr=self.renderer.render(vertices=verts, faces=self.chest_faces, focal_length=fl, principal_point=cc, translation=tr[i])
                 cm=cr[...,3].unsqueeze(1)
-
                 md=meta[i]
                 vm=torch.ones_like(masks[i])
                 border=int(self.image_size*0.12)
@@ -1985,7 +3552,8 @@ class MultiImageOptimizer:
                 rw=BodyRegionWeights.create_weight_map(self.image_size, self.image_size, self.device)
                 if rw.dim()==3: rw=rw.unsqueeze(0)
                 cv=float(md.get("chest_visible",0.0)); hv=float(md.get("hip_visible",0.0))
-                rw=rw*self.sil_region_weights*(1.0+0.20*cv*self.region_maps["breast"])*(1.0+0.12*hv*self.region_maps["glutes"])
+                breast_core=self.region_maps.get("breast_fit", self.region_maps["breast"])
+                rw=rw*self.sil_region_weights*(1.0+0.16*cv*breast_core)*(1.0+0.12*hv*self.region_maps["glutes"])
 
                 pose_kpw=torch.tensor(pose_keypoint_weight_all[i], dtype=torch.float32, device=self.device)
                 if cfg.get("torso_only", False):
@@ -2021,6 +3589,9 @@ class MultiImageOptimizer:
                 lcleav=self._cleavage_bridge_loss(cm, masks[i], pj, md)
                 lgap=self._interbreast_gap_loss(rm, cm, masks[i], pj, md)
                 lstern=self._sternum_flatten_loss(cos)
+                lnipple,limf,lareola,lstern_lm,lcleav_lm,lch_lm_conf,lch_lm_count,lch_lm_w = self._chest_landmark_losses(
+                    rm, cm, masks[i], silhouette_valid, md
+                )
 
                 labd=self._abdomen_guard_loss(rm, masks[i], md)
                 labd_area=self._abdomen_area_loss(rm, ta_all[i], md)
@@ -2032,6 +3603,14 @@ class MultiImageOptimizer:
                 lpose=pose_prior_loss(bp[i])
                 ltrans=translation_loss(tr[i])
                 lfocal=self._focal_regularization(lfs)
+
+                # Main fit never trains/evaluates breast soft-tissue. Report zeros so
+                # logs clearly show that all breast correction happens in the post-pass.
+                lbsoft_guard=torch.tensor(0.0, device=self.device)
+                lbsoft_lm=torch.tensor(0.0, device=self.device)
+                lbsoft_nipple=torch.tensor(0.0, device=self.device)
+                lbsoft_imf=torch.tensor(0.0, device=self.device)
+                lbsoft_areola=torch.tensor(0.0, device=self.device)
 
                 ljoint_anchor,lpose_anchor,lcamera_anchor,lbeta_anchor,lsil_guard = self._anchor_losses(
                     pj=pj,
@@ -2083,6 +3662,11 @@ class MultiImageOptimizer:
                     cfg["cleavage"]*lcleav +
                     cfg["gap"]*lgap +
                     cfg["sternum"]*lstern +
+                    cfg.get("nipple_lm",0.0)*lnipple +
+                    cfg.get("imf_lm",0.0)*limf +
+                    cfg.get("areola_lm",0.0)*lareola +
+                    cfg.get("sternum_lm",0.0)*lstern_lm +
+                    cfg.get("cleavage_lm",0.0)*lcleav_lm +
                     cfg["abdomen"]*labd +
                     cfg["abdomen_area"]*labd_area +
                     cfg["waist"]*lwaist +
@@ -2099,7 +3683,9 @@ class MultiImageOptimizer:
                     cfg.get("anchor_camera",0.0)*lcamera_anchor +
                     cfg.get("anchor_beta",0.0)*lbeta_anchor +
                     cfg.get("sil_guard",0.0)*lsil_guard +
-                    cfg.get("chest_residual",0.0)*lchest_resid
+                    cfg.get("chest_residual",0.0)*lchest_resid +
+                    cfg.get("breast_soft_guard",0.0)*lbsoft_guard +
+                    cfg.get("breast_soft_lm",0.0)*lbsoft_lm
                 )
 
                 total += il
@@ -2110,9 +3696,12 @@ class MultiImageOptimizer:
                     "width":lwidth,"area":larea,"bloat":lbloat,
                     "chest_proj":lcproj,"chest_width":lcw,"chest_area":lca,
                     "bilat_w":lbw,"bilat_a":lba,"bilat_c":lbc,"cleavage":lcleav,"gap":lgap,"sternum":lstern,
+                    "nipple_lm":lnipple,"imf_lm":limf,"areola_lm":lareola,"sternum_lm":lstern_lm,"cleavage_lm":lcleav_lm,"ch_lm_conf":lch_lm_conf,"ch_lm_count":lch_lm_count,"ch_lm_w":lch_lm_w,
                     "abdomen":labd,"abdomen_area":labd_area,"waist":lwaist,
                     "glute_w":lgw,"glute_a":lga,"glute_bloat":lgb,
-                    "chest_reg":lreg,"chest_l2":l2,"chest_smooth":sm,"shape":lshape,"beta":lbeta,"pose":lpose,"trans":ltrans,"focal":fl[0,0],"valid":valids[i].mean(),"pose_q":torch.tensor(pose_quality_all[i],device=self.device),"pose_kw":torch.tensor(pose_keypoint_weight_all[i],device=self.device),"pose_iw":torch.tensor(pose_image_weight_all[i],device=self.device)}
+                    "chest_reg":lreg,"chest_l2":l2,"chest_smooth":sm,
+                    "breast_soft_reg":bsoft_reg_global,"breast_soft_guard":lbsoft_guard,"breast_soft_lm":lbsoft_lm,"breast_soft_nipple":lbsoft_nipple,"breast_soft_imf":lbsoft_imf,"breast_soft_areola":lbsoft_areola,
+                    "shape":lshape,"beta":lbeta,"pose":lpose,"trans":ltrans,"focal":fl[0,0],"valid":valids[i].mean(),"pose_q":torch.tensor(pose_quality_all[i],device=self.device),"pose_kw":torch.tensor(pose_keypoint_weight_all[i],device=self.device),"pose_iw":torch.tensor(pose_image_weight_all[i],device=self.device)}
 
                 if self.debug and (it % self.debug_every == 0 or it == iterations - 1) and i < self.debug_max_images:
                     self._save_render_debug(
@@ -2130,7 +3719,7 @@ class MultiImageOptimizer:
                         arm_prior=arm_prior,
                     )
 
-            total = total + cfg["chest_reg"]*lreg
+            total = total + cfg["chest_reg"]*lreg + cfg.get("breast_soft_reg",0.0)*bsoft_reg_global
             total.backward()
             opt.step()
 
@@ -2156,6 +3745,8 @@ class MultiImageOptimizer:
                     "abd":f"{ll['abdomen'].item():.4f}",
                     "gl":f"{ll['glute_a'].item():.4f}",
                     "ch":f"{ll['chest_proj'].item():.4f}",
+                    "nlm":f"{ll['nipple_lm'].item():.3f}",
+                    "bslm":f"{ll['breast_soft_lm'].item():.3f}",
                     "pq":f"{ll['pose_q'].item():.2f}",
                     "rpx":f"{ll['reproj'].item():.1f}",
                     "lrpx":f"{ll['lower_reproj_px'].item():.1f}",
@@ -2200,6 +3791,14 @@ class MultiImageOptimizer:
                     f"  cleavage:    {ll['cleavage'].item():.6f}\n"
                     f"  gap:         {ll['gap'].item():.6f}\n"
                     f"  sternum:     {ll['sternum'].item():.6f}\n"
+                    f"  nipple_lm:   {ll['nipple_lm'].item():.6f}\n"
+                    f"  imf_lm:      {ll['imf_lm'].item():.6f}\n"
+                    f"  areola_lm:   {ll['areola_lm'].item():.6f}\n"
+                    f"  sternum_lm:  {ll['sternum_lm'].item():.6f}\n"
+                    f"  cleavage_lm: {ll['cleavage_lm'].item():.6f}\n"
+                    f"  ch_lm_conf:  {ll['ch_lm_conf'].item():.6f}\n"
+                    f"  ch_lm_count: {ll['ch_lm_count'].item():.0f}\n"
+                    f"  ch_lm_w:     {ll['ch_lm_w'].item():.6f}\n"
                     f"  abdomen:     {ll['abdomen'].item():.6f}\n"
                     f"  abd_area:    {ll['abdomen_area'].item():.6f}\n"
                     f"  waist:       {ll['waist'].item():.6f}\n"
@@ -2207,6 +3806,12 @@ class MultiImageOptimizer:
                     f"  glute_area:  {ll['glute_a'].item():.6f}\n"
                     f"  glute_bloat: {ll['glute_bloat'].item():.6f}\n"
                     f"  chest_reg:   {ll['chest_reg'].item():.8f}\n"
+                    f"  breast_soft_reg:   {ll['breast_soft_reg'].item():.8f}\n"
+                    f"  breast_soft_guard: {ll['breast_soft_guard'].item():.8f}\n"
+                    f"  breast_soft_lm:    {ll['breast_soft_lm'].item():.8f}\n"
+                    f"  breast_soft_nipple:{ll['breast_soft_nipple'].item():.8f}\n"
+                    f"  breast_soft_imf:   {ll['breast_soft_imf'].item():.8f}\n"
+                    f"  breast_soft_areola:{ll['breast_soft_areola'].item():.8f}\n"
                     f"  chest_l2:    {ll['chest_l2'].item():.8f}\n"
                     f"  chest_smooth:{ll['chest_smooth'].item():.8f}\n"
                     f"  shape:       {ll['shape'].item():.6f}\n"
@@ -2225,6 +3830,22 @@ class MultiImageOptimizer:
                     f"  pose_iw:     {ll['pose_iw'].item():.3f}"
                 )
 
+        breast_only_summary=self._run_breast_only_refinement(
+            betas=betas,
+            cos=cos,
+            bp=bp,
+            go=go,
+            tr=tr,
+            lfs=lfs,
+            cc=cc,
+            masks=masks,
+            valids=valids,
+            meta=meta,
+            tw_all=tw_all,
+            iw=iw,
+            debug_dir=debug_dir,
+        )
+
         with torch.no_grad():
             ff=self._current_focal(lfs)
             fco=self._chest_offsets_full(cos)
@@ -2235,11 +3856,14 @@ class MultiImageOptimizer:
                 transl=None,
                 return_verts=True,
             )
-            nverts=nout.vertices + fco
+            nbase_verts=nout.vertices + fco
+            nverts=self._apply_breast_soft_tissue(nbase_verts, nout.joints)
             piv=[]; pij=[]
             for i in range(num_images):
                 oi=self.model(betas=betas, body_pose=bp[i], global_orient=go[i], transl=None, return_verts=True)
-                piv.append((oi.vertices+fco).detach().cpu().numpy()[0])
+                ibase=oi.vertices+fco
+                icorr=self._apply_breast_soft_tissue(ibase, oi.joints)
+                piv.append(icorr.detach().cpu().numpy()[0])
                 pij.append(oi.joints.detach().cpu().numpy()[0])
             vrm=RegionAwareMasks.template_vertex_masks(nverts.detach()[0])
 
@@ -2263,6 +3887,12 @@ class MultiImageOptimizer:
             "has_abdomen_glute_guards":np.array([1], dtype=np.int32),
             "has_interbreast_gap_loss":np.array([1], dtype=np.int32),
             "has_render_debug_export":np.array([1], dtype=np.int32),
+            "has_breast_soft_tissue_layer":np.array([1 if self.breast_soft is not None else 0], dtype=np.int32),
+            "has_breast_only_refinement":np.array([1 if (self.breast_soft is not None and self.breast_only_refine) else 0], dtype=np.int32),
+            "breast_only_refine_summary_json":np.array([json.dumps(breast_only_summary if 'breast_only_summary' in locals() else self._breast_only_refine_summary)]),
+            "breast_soft_tissue_prior_json":np.array([str(self.breast_prior_json) if self.breast_prior_json is not None else ""]),
+            "breast_soft_tissue_weights_npz":np.array([str(self.breast_weights_npz) if self.breast_weights_npz is not None else ""]),
+            "breast_soft_tissue_params_json":np.array([json.dumps(self.breast_soft.parameters_as_dict() if self.breast_soft is not None else {})]),
             "has_pose_quality_weighting":np.array([1], dtype=np.int32),
             "has_pose_lock_schedule":np.array([1], dtype=np.int32),
             "has_mask_stats_loss":np.array([1], dtype=np.int32),

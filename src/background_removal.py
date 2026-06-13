@@ -47,9 +47,11 @@ Notes:
     - Hair-aware outputs are written for downstream SMPL-X fitting:
         <stem>_hair.png
         <stem>_hair_remove.png
-        <stem>_alpha_original.png
+        <stem>_alpha_original.png        # full body + hair alpha
+        <stem>_alpha_visual.png          # alpha written into main PNG
+        <stem>_body_fit_alpha.png        # body-only fitting alpha
         <stem>_body_fit_mask.png
-        <stem>_silhouette_validity.png
+        <stem>_silhouette_validity.png   # 0 = ignore/unknown, e.g. hair occlusion
 """
 
 from __future__ import annotations
@@ -106,9 +108,11 @@ class BackgroundRemover:
         max_subject_area: float = 0.68,
         threshold: float = 0.50,
         enable_hair_mask: bool = True,
-        hair_remove_from_output: bool = True,
-        hair_confidence_threshold: float = 0.42,
-        hair_dilate_px: int = 9,
+        # Keep visual output alpha identical to the full foreground by default.
+        # Hair is exported separately as an occlusion/ignore mask for fitting.
+        hair_remove_from_output: bool = False,
+        hair_confidence_threshold: float = 0.58,
+        hair_dilate_px: int = 3,
     ) -> None:
         self.debug = debug
         self.fail_hard = fail_hard
@@ -119,6 +123,8 @@ class BackgroundRemover:
         self.threshold = float(threshold)
         self.enable_hair_mask = bool(enable_hair_mask)
         self.hair_remove_from_output = bool(hair_remove_from_output)
+        # Backward-compatible alias used by downstream code/readability.
+        self.keep_hair_in_output_alpha = not self.hair_remove_from_output
         self.hair_confidence_threshold = float(hair_confidence_threshold)
         self.hair_dilate_px = int(hair_dilate_px)
 
@@ -412,9 +418,10 @@ class BackgroundRemover:
         # --------------------------------------------------------------
         # Hair-aware fitting artifacts
         # --------------------------------------------------------------
-        # alpha_original keeps the complete foreground alpha before hair removal.
-        # body_fit_alpha is the alpha written into the RGBA output by default,
-        # so downstream SMPL-X fitting does not treat loose hair as torso volume.
+        # alpha_original is the full visual foreground: body + face + hair.
+        # Do not remove hair from this alpha by default. The previous version
+        # wrote body_fit_alpha into the main PNG, which is why alpha looked
+        # worse than alpha_original on hair-heavy images.
         alpha_original = alpha.copy()
 
         hair_prob = self._hair_probability(
@@ -440,18 +447,35 @@ class BackgroundRemover:
             box=box,
         )
 
+        # Body fitting alpha intentionally excludes confident hair occlusion.
+        # Use it only for silhouette terms that should ignore hair, not for
+        # the final cutout PNG.
         body_fit_alpha = alpha_original.copy()
         body_fit_alpha[hair_remove > 0] = 0
         body_fit_alpha = cv2.bitwise_and(body_fit_alpha, body_fit_mask)
 
+        visual_alpha = alpha_original.copy()
         if self.hair_remove_from_output and self.enable_hair_mask:
-            alpha = body_fit_alpha
+            # Backward-compatible opt-in for old behaviour. Not recommended
+            # for visual cutouts; kept only for pipelines that explicitly want
+            # a body-only PNG.
+            visual_alpha = body_fit_alpha
 
         rgba = cv2.cvtColor(bgr, cv2.COLOR_BGR2BGRA)
-        rgba[:, :, 3] = alpha
+        rgba[:, :, 3] = visual_alpha
 
         out_path = output_dir / f"{image_path.stem}.png"
         cv2.imwrite(str(out_path), rgba)
+
+        # Always export fitting/debug masks next to the output, even when
+        # debug=False. The optimizer should use these explicitly.
+        cv2.imwrite(str(output_dir / f"{image_path.stem}_alpha_original.png"), alpha_original)
+        cv2.imwrite(str(output_dir / f"{image_path.stem}_alpha_visual.png"), visual_alpha)
+        cv2.imwrite(str(output_dir / f"{image_path.stem}_body_fit_alpha.png"), body_fit_alpha)
+        cv2.imwrite(str(output_dir / f"{image_path.stem}_body_fit_mask.png"), body_fit_mask)
+        cv2.imwrite(str(output_dir / f"{image_path.stem}_silhouette_validity.png"), silhouette_validity)
+        cv2.imwrite(str(output_dir / f"{image_path.stem}_hair.png"), np.clip(hair_prob * 255.0, 0, 255).astype(np.uint8))
+        cv2.imwrite(str(output_dir / f"{image_path.stem}_hair_remove.png"), hair_remove)
 
         if self.debug:
             self._write_debug(
@@ -480,7 +504,9 @@ class BackgroundRemover:
                     "alpha_original": alpha_original,
                     "body_fit_mask": body_fit_mask,
                     "silhouette_validity": silhouette_validity,
-                    "alpha": alpha,
+                    "alpha": visual_alpha,
+                    "alpha_visual": visual_alpha,
+                    "body_fit_alpha": body_fit_alpha,
                 },
             )
 
@@ -2113,8 +2139,9 @@ if __name__ == "__main__":
     parser.add_argument("--threshold", type=float, default=0.50)
     parser.add_argument("--no-hair-mask", action="store_true")
     parser.add_argument("--keep-hair-in-output-alpha", action="store_true")
-    parser.add_argument("--hair-threshold", type=float, default=0.42)
-    parser.add_argument("--hair-dilate-px", type=int, default=9)
+    parser.add_argument("--hair-threshold", type=float, default=0.58)
+    parser.add_argument("--hair-dilate-px", type=int, default=3)
+    parser.add_argument("--remove-hair-from-output-alpha", action="store_true", help="Opt in to legacy body-only output alpha. By default the main PNG preserves hair.")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
@@ -2130,7 +2157,7 @@ if __name__ == "__main__":
         fail_hard=args.fail_hard,
         threshold=args.threshold,
         enable_hair_mask=not args.no_hair_mask,
-        hair_remove_from_output=not args.keep_hair_in_output_alpha,
+        hair_remove_from_output=args.remove_hair_from_output_alpha and not args.keep_hair_in_output_alpha,
         hair_confidence_threshold=args.hair_threshold,
         hair_dilate_px=args.hair_dilate_px,
         debug=args.debug,
